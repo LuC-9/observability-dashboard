@@ -1,0 +1,18 @@
+# Build context hygiene for `gcloud builds submit`
+**/node_modules
+**/.venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/dist
+backend/static
+backend/data
+backend/tests
+.git
+.gitignore
+.dockerignore
+.emergent
+memory
+test_reports
+*.md
+README*

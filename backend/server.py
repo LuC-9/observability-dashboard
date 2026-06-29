@@ -14,6 +14,8 @@ import jwt
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import seed_data
@@ -849,3 +851,22 @@ def refresh_pipeline(_user=Depends(require_auth)):
 @app.get("/api/refresh/status")
 def refresh_status(execution: str, _user=Depends(require_auth)):
     return {"state": "SUCCEEDED"}
+
+
+# ─── Static SPA (production: served from /app/backend/static) ─────────────────
+
+_STATIC_DIR = Path(__file__).parent / "static"
+if _STATIC_DIR.is_dir():
+    # Serve hashed Vite assets under /assets/* and other static files
+    app.mount("/assets", StaticFiles(directory=str(_STATIC_DIR / "assets")), name="assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def spa(full_path: str):
+        # /api/* must 404 (already handled by API routes; any miss is a real 404)
+        if full_path.startswith("api/"):
+            raise HTTPException(404, "not found")
+        # Serve a real file if it exists (favicon, vite.svg, etc.); else index.html
+        candidate = _STATIC_DIR / full_path
+        if full_path and candidate.is_file():
+            return FileResponse(str(candidate))
+        return FileResponse(str(_STATIC_DIR / "index.html"))
