@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+google-cloud-bigquery
+google-cloud-workflows
+google-auth
+requests
+PyJWT
+pydantic
+python-multipart

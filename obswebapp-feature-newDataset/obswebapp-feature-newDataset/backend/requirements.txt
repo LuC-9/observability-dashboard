@@ -1,0 +1,10 @@
+fastapi>=0.110
+uvicorn[standard]>=0.27
+pydantic>=2
+plotly>=5.23.0
+pandas>=2.0.0
+google-cloud-bigquery>=3.11.0
+google-cloud-bigquery[pandas]
+db-dtypes
+python-dotenv
+pyarrow>=14.0.0
