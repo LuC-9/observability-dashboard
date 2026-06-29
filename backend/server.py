@@ -20,7 +20,13 @@ from pydantic import BaseModel
 
 import seed_data
 
-load_dotenv()
+# Load .env from the project root (one level above backend/). Falls back to
+# backend/.env if a developer kept one there, then to process env.
+_ROOT_ENV = Path(__file__).resolve().parent.parent / ".env"
+if _ROOT_ENV.is_file():
+    load_dotenv(_ROOT_ENV)
+else:
+    load_dotenv()
 
 DB_PATH = Path(os.environ.get("DB_PATH", str(Path(__file__).parent / "data" / "local.db")))
 JWT_SECRET = os.environ.get("JWT_SECRET", "change-me-dev-secret")

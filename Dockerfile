@@ -19,16 +19,19 @@ COPY backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Backend source
-COPY backend/ ./
+COPY backend/ ./backend/
+# .env lives at the project root (so it sits one level above backend/)
+COPY .env ./.env
 
 # Frontend production bundle (index.html + assets/*) — produced in stage 1
-COPY --from=frontend-builder /backend/static ./static
+COPY --from=frontend-builder /backend/static ./backend/static
 
 # SQLite DB lives here at runtime — Cloud Run gives us a writable /app
 RUN mkdir -p /app/data
 ENV DB_PATH=/app/data/local.db
 ENV PORT=7860
 
+WORKDIR /app/backend
 EXPOSE 7860
 
 # Cloud Run injects $PORT — honour it; default to 7860 otherwise.
