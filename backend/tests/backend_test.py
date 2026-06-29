@@ -40,6 +40,23 @@ def test_config():
     assert r.status_code == 200
     j = r.json()
     assert "google_client_id" in j and "allowed_domain" in j
+    # In this env, GOOGLE_CLIENT_ID is empty and ALLOWED_DOMAIN is loreal.com
+    assert j["google_client_id"] == ""
+    assert j["allowed_domain"] == "loreal.com"
+
+
+# ── Google SSO endpoint ───────────────────────────────────────────
+def test_login_google_not_configured():
+    """When GOOGLE_CLIENT_ID is empty, /api/login/google -> 400 'SSO not configured'."""
+    r = requests.post(f"{API}/login/google", json={"credential": "anything"}, timeout=15)
+    assert r.status_code == 400, r.text
+    assert "SSO" in r.text or "not configured" in r.text.lower()
+
+
+def test_login_google_bad_shape():
+    """Missing 'credential' field -> 422 validation error."""
+    r = requests.post(f"{API}/login/google", json={}, timeout=15)
+    assert r.status_code == 422
 
 
 def test_iap_unauth():

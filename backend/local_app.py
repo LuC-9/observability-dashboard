@@ -208,9 +208,37 @@ def do_login(c: Creds):
     return {"token": make_token(c.username), "user": c.username}
 
 
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+ALLOWED_DOMAIN   = os.environ.get("ALLOWED_DOMAIN", "")
+
+
+class GoogleCreds(BaseModel):
+    credential: str
+
+
+@app.post("/api/login/google")
+def do_login_google(c: GoogleCreds):
+    """Verify a Google Identity ID token; restrict to ALLOWED_DOMAIN if set."""
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(400, "SSO not configured")
+    from google.oauth2 import id_token
+    from google.auth.transport import requests as grequests
+    try:
+        info = id_token.verify_oauth2_token(c.credential, grequests.Request(), GOOGLE_CLIENT_ID)
+    except Exception:
+        raise HTTPException(401, "invalid Google token")
+    email = (info.get("email") or "").lower()
+    hd = info.get("hd")
+    if ALLOWED_DOMAIN and not (email.endswith("@" + ALLOWED_DOMAIN) or hd == ALLOWED_DOMAIN):
+        raise HTTPException(403, f"only {ALLOWED_DOMAIN} accounts allowed")
+    if not email:
+        raise HTTPException(401, "no email in Google token")
+    return {"token": make_token(email), "user": email}
+
+
 @app.get("/api/config")
 def get_config():
-    return {"google_client_id": "", "allowed_domain": ""}
+    return {"google_client_id": GOOGLE_CLIENT_ID, "allowed_domain": ALLOWED_DOMAIN}
 
 
 @app.get("/api/auth/iap")

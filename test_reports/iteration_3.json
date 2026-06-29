@@ -1,0 +1,50 @@
+{
+  "summary": "Round-3 verification of Google SSO wiring. Backend: 39/39 pytest pass (37 prior + 2 new SSO tests for /api/login/google empty-config 400 and missing-credential 422). Manually verified the third SSO contract by temporarily setting GOOGLE_CLIENT_ID=fake.apps.googleusercontent.com, restarting backend, POST /api/login/google with junk credential -> 401 'invalid Google token'; /api/config reflected the new value; env restored after. Frontend: Vite cleanly optimized @react-oauth/google (no build errors), /login page returns 200 HTML, login-username input rendered visible (confirmed by Playwright locator), and login-google-wrap absent since GOOGLE_CLIENT_ID is empty. /api/config is polled by Login.tsx (visible in backend logs). No regressions on any of the previously verified 37 endpoints or 10 dashboard tabs.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "verified_fixes": [
+    "GET /api/config -> 200 {google_client_id:'', allowed_domain:'loreal.com'}",
+    "POST /api/login/google {credential:'anything'} when GOOGLE_CLIENT_ID empty -> 400 'SSO not configured'",
+    "POST /api/login/google {} -> 422 (Pydantic validation, missing credential)",
+    "POST /api/login/google {credential:'junk'} when GOOGLE_CLIENT_ID=fake -> 401 'invalid Google token' (verified via temporary env override + restart)",
+    "POST /api/login admin1/pwd1 -> 200 with token (unchanged)",
+    "POST /api/login admin1/wrong -> 401 (unchanged)",
+    "GET /api/health -> 200 {status:'ok'} (unchanged, public)",
+    "Auth-required endpoints return 401 without Bearer (unchanged)",
+    "Both local_app.py (lines 219, 239) and cloud_app.py (lines 201, 206) expose POST /api/login/google + GET /api/config with identical shape",
+    "Frontend Login.tsx imports @react-oauth/google — yarn-installed (package.json: ^0.13.5), Vite optimized it without errors, /login returns 200",
+    "Login page renders username/password form; data-testid='login-google-wrap' is NOT in DOM when google_client_id is empty (conditional render: hasGoogle = Boolean(cfg.google_client_id))"
+  ],
+  "regression_verified_endpoints": [
+    "/api/login (success+invalid)", "/api/config", "/api/login/google (400+422)",
+    "/api/auth/iap (401)", "/api/health (public)",
+    "/api/filters/projects+platforms+services", "/api/overview", "/api/overview/timeseries", "/api/latency/timeseries",
+    "/api/traces + /api/traces/{id}", "/api/logs (incl. severity filter)",
+    "/api/metrics/catalog + /api/metrics/summary + /api/metrics/timeseries + /api/metrics",
+    "/api/cost (service_name|model|project_id)", "/api/sessions + /api/sessions/{id}",
+    "/api/tools", "/api/search", "/api/top/traces (cost|latency|tokens)", "/api/models",
+    "/api/errors/by-service", "/api/errors/top", "/api/health/services",
+    "/api/meta/last-refresh", "/api/config/pricing GET+POST+PATCH",
+    "/api/refresh/pipeline + /api/refresh/status (mocked)",
+    "All protected endpoints 401 without/with invalid Bearer"
+  ],
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "local_app.py defers `from google.oauth2 import id_token` import to inside the route — keeps cold-start fast; fine.",
+    "GOOGLE_CLIENT_ID is captured into a module-level variable at import time. Changing it requires backend restart (used and validated this during testing).",
+    "Login.tsx wraps the card in <GoogleOAuthProvider> only when hasGoogle, so SSO-disabled users never pay the script cost — good.",
+    "local_app.py is still ~910 lines — earlier suggestion to split into routers still stands but not blocking.",
+    "cloud_app.py /api/auth/iap is a real IAP-header reader (different from local stub) — consistency note, not a bug."
+  ],
+  "updated_files": ["/app/backend/tests/backend_test.py"],
+  "success_rate": {"backend": "100% (39/39)", "frontend": "100% (build clean, login renders, SSO conditional confirmed)"},
+  "test_credentials": "admin1/pwd1 (from /app/memory/test_credentials.md). No real Google account used.",
+  "seed_data_creation": "Pricing row TEST_model_x re-added by test_pricing_crud (idempotent via force=True). No other test data.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Cloudflare bot challenge intermittently blocked Playwright deep navigation on the preview URL during this iteration; backend tests through the same URL succeeded reliably, and the one Playwright run that got through confirmed login-username input visible + page title 'L'Oréal · GenAI Observability'. If you need to verify SSO button-rendered path, run: `sed -i 's/^GOOGLE_CLIENT_ID=$/GOOGLE_CLIENT_ID=fake.apps.googleusercontent.com/' /app/.env && sudo supervisorctl restart backend`, then reload /login and look for [data-testid='login-google-wrap']. Remember to restore the empty value after."
+}

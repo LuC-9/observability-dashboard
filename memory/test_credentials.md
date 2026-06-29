@@ -1,13 +1,20 @@
 # Test Credentials
 
 ## Dashboard Login
-- **URL**: https://f91ea9ce-4f4b-4aed-87d3-4af955922294.preview.emergentagent.com
-- **Username**: `admin1`
-- **Password**: `pwd1`
 
-Auth mechanism: JWT (HS256), 24 hour expiry. Issued by POST `/api/login`.
-Credentials configurable via backend env vars `ADMIN_USER` / `ADMIN_PASS`.
+### 1. Username / password (always works, fallback path)
+- **Username:** `admin1`
+- **Password:** `pwd1`
+- (Overridable via `ADMIN_USER` / `ADMIN_PASS` env vars.)
 
-## Google SSO
-Not configured in this environment (GOOGLE_CLIENT_ID is empty). The SSO button
-in the login UI is hidden when no client id is configured.
+### 2. Google SSO (when `GOOGLE_CLIENT_ID` is set in `/app/.env`)
+- Domain allowlist: controlled by `ALLOWED_DOMAIN` in `.env`. Default `loreal.com`.
+- Allowed test identities (in this env): any `@loreal.com` Google Workspace user.
+- RBAC: all signed-in users currently have the same single role (full dashboard read).
+  Per-user roles aren't enforced yet.
+- No app-managed password — auth is delegated to Google.
+
+### Auth flow notes
+- Backend issues an HS256 JWT (24h TTL) after either path succeeds.
+- Token is stored in `localStorage.token` and sent as `Authorization: Bearer ...`.
+- `/api/auth/iap` is a stub here; it returns 401 outside of Identity-Aware Proxy.

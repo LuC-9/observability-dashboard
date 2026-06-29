@@ -3,8 +3,8 @@ uvicorn[standard]
 pydantic
 python-dotenv
 PyJWT
+google-auth
 google-cloud-bigquery
 google-cloud-bigquery-storage
 google-cloud-workflows
-google-auth
 db-dtypes
