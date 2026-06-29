@@ -1,42 +1,53 @@
-# Central Observability Dashboard — PRD
+# PRD — Central GenAI Observability Dashboard
 
-## Problem Statement
-Clone github.com/LuC-9/observability-dashboard. Use the `dashboard/` frontend
-(React + Vite + AntD + ECharts) and the `obswebapp-feature-newDataset/` backend
-data implementation (SQLite + wide_* seeded schema). Keep all dashboard charts.
+## Original Problem Statement
+Clone https://github.com/LuC-9/observability-dashboard. The repo contains two implementations under `obswebapp-feature-newDataset/`:
 
-## Architecture
-- **Frontend**: Vite + React 18 + TypeScript + Ant Design + ECharts (from `dashboard/frontend`)
-- **Backend**: FastAPI + SQLite, served via supervisor on :8001
-- **Database**: SQLite file at `/app/backend/data/local.db`, seeded with 30 days of dummy data
-- **Auth**: JWT (HS256), simple username/password (admin1 / pwd1)
+1. `dashboard/` — full React + AntD + ECharts frontend with rich charts, plus a FastAPI backend that queries BigQuery.
+2. `obswebapp-feature-newDataset/` — alternate FastAPI backend with SQLite "local" mode, seed data, and a `wide_*` star-schema.
 
-## Data Source
-The original dashboard backend queried BigQuery `gold.spans / gold.logs / gold.metrics`.
-We replace it with SQLite tables seeded from `seed_data.py` (obswebapp folder):
-- `wide_spans_detail` → spans (mapped: service_id→service_name, environment→source_platform, session_id→conversation_id, model_id→model)
-- `wide_logs_detail` → logs
-- `wide_metrics_detail` → metrics
-- `wide_llm_interactions_detail` → cost/token aggregations (joined via trace_id/session_id)
-- `wide_tool_executions_detail` → tool calls
-- `llm_pricing` → SCD2 pricing table
+Goal: **keep the `dashboard/` frontend (with all its charts) and use the database/seeding implementation from the second folder**.
 
-## What's Implemented (2026-01-29)
-- All dashboard tabs functional: Overview, Traces, Logs, Metrics, LLM Cost, Sessions, Tool Calls, Insights, Health, Compare
-- 25+ API endpoints rewritten in SQLite (server.py): /api/login, /api/config, /api/overview, /api/overview/timeseries, /api/traces, /api/traces/{id}, /api/logs, /api/metrics/catalog|summary|timeseries|metrics, /api/cost, /api/sessions, /api/sessions/{id}, /api/tools, /api/search, /api/top/traces, /api/models, /api/errors/by-service|top, /api/latency/timeseries, /api/health, /api/meta/last-refresh, /api/refresh/*, /api/config/pricing (GET/POST/PATCH), /api/filters/projects|platforms|services, /api/auth/iap
-- Bootstrap seeds 30 days of realistic observability data on first startup
-- Charts confirmed rendering: KPI tiles, Cost & Errors trends, LLM cost bar/donut by service, log severity breakdown, traces table, latency distribution
-- Default time range set to "Last 1 day" for better out-of-box data visibility
+## Architecture (as built — 2026-06-29)
+- **Frontend** (`/app/frontend`): copy of `dashboard/frontend` — Vite + React 18 + TypeScript + AntD 5 + ECharts. `yarn start` → `vite --host 0.0.0.0 --port 3000`. Uses relative `/api` URLs proxied through Kubernetes ingress to backend port 8001.
+- **Backend** (`/app/backend/server.py`): FastAPI app, ~850 lines. Uses **SQLite** at `/app/backend/data/local.db` with the `wide_*` schema from `obswebapp/seed_data.py`. Re-exposes the API contract the dashboard frontend expects:
+  - Auth: `POST /api/login` (JWT, 24h), `GET /api/auth/iap` (401 stub), `GET /api/config`.
+  - Filters: `/api/filters/{projects,platforms,services}`.
+  - Overview: `/api/overview`, `/api/overview/timeseries`, `/api/latency/timeseries`.
+  - Traces/Logs: `/api/traces`, `/api/traces/{id}`, `/api/logs`.
+  - Metrics: `/api/metrics/{catalog,summary,timeseries}`, `/api/metrics`.
+  - Cost & Sessions: `/api/cost`, `/api/sessions`, `/api/sessions/{id}`.
+  - Insights: `/api/tools`, `/api/search`, `/api/top/traces`, `/api/models`, `/api/errors/by-service`, `/api/errors/top`.
+  - Health & Meta: `/api/health` (public), `/api/health/services` (auth), `/api/meta/last-refresh`.
+  - Pricing CRUD: `/api/config/pricing` GET/POST/PATCH.
+  - Refresh: `/api/refresh/pipeline` POST + `/api/refresh/status` GET (mocked SUCCEEDED).
+- **DB bootstrap**: on first start, `bootstrap_db()` creates 17 `wide_*` tables and seeds ~2000 rows spanning the last 30 days using the original `seed_data.gen_*` generators. Idempotent — skips if `wide_spans_detail` is non-empty.
+- **Auth**: HS256 JWT, default credentials `admin1 / pwd1` (overridable via `ADMIN_USER`/`ADMIN_PASS` env). All `/api/*` endpoints except `/api/login`, `/api/config`, `/api/auth/iap`, `/api/health` require a Bearer token.
 
-## Test Credentials
-See `/app/memory/test_credentials.md`
+## What's implemented (2026-06-29)
+- Full dashboard UI from the `dashboard/` folder rendering all 10 tabs (Overview, Traces, Logs, Metrics, LLM Cost, Sessions, Tool Calls, Insights, Health, Compare) with charts from ECharts.
+- SQLite-backed implementation of every endpoint the frontend calls, mapped onto the `wide_*` star schema (cost & token data from `wide_llm_interactions_detail`, spans from `wide_spans_detail`, etc.).
+- 30 days of seed data on first boot.
+- JWT auth, Google SSO button auto-hidden when no `GOOGLE_CLIENT_ID` configured.
+- Pricing config CRUD with active/inactive versioning.
+- Refresh pipeline mocked (no Cloud Workflows in this env).
+- 37/37 backend pytest tests pass; all 10 frontend tabs verified by the testing agent.
 
-## Backlog (P1/P2)
-- Wire up metrics chart "Request throughput by response_code_class" — seed lacks this dimension
-- Wire up Compare tab (UI exists but needs data)
-- Google SSO (intentionally disabled in this local environment)
-- Real BigQuery integration as alternative backend (currently SQLite-only)
+## Personas
+- **Platform engineer** monitoring agent latency, error rates, and cost across services & projects.
+- **GenAI app developer** drilling into traces, spans, prompts, and tool calls to debug a session.
+- **FinOps owner** tracking LLM cost by model / service / project and trending it over time.
 
-## Next Action Items
-- Optional: enrich seed_data with response_code_class for full Metrics tab parity
-- Optional: add Refresh/pipeline real implementation (currently mocked)
+## Tech stack
+- React 18 + TS + Vite + AntD 5 + ECharts (frontend)
+- FastAPI + SQLite + PyJWT + python-dotenv (backend)
+- Yarn (frontend deps), pip (backend deps)
+
+## Backlog
+- P1: Real ETL — wire bootstrap to ingest from OTLP / Cloud Storage / BigQuery instead of seed generators.
+- P1: Persist pricing edits to a real source-of-truth (currently SQLite).
+- P2: Split `server.py` into per-domain routers (`metrics`, `traces`, `cost`, `pricing`, etc.) — file is ~850 lines.
+- P2: SQLite connection pool / WAL mode for higher concurrency.
+- P2: Validate `pid` exists in `PATCH /api/config/pricing/{pid}` (currently silently no-ops on bad id).
+- P3: Google OAuth real flow (currently only the button hides when client_id is empty).
+- P3: Compare tab — confirm it renders meaningfully with non-empty datasets.
