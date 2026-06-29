@@ -530,7 +530,7 @@ def metrics_ts(category: str | None = None, group: str | None = None, agg: str |
                metric_type: str | None = None,
                project: str | None = None, service: str | None = None,
                time_range: str = "1h", start: str | None = None, end: str | None = None,
-               **_kw):
+               _user=Depends(require_auth)):
     s, e = time_window(time_range, start, end)
     fmt = bucket_fmt(time_range)
     cl = ["timestamp BETWEEN ? AND ?"]
@@ -561,7 +561,7 @@ def metrics_ts(category: str | None = None, group: str | None = None, agg: str |
 def metrics_table(project: str | None = None, service: str | None = None,
                   time_range: str = "1h", start: str | None = None, end: str | None = None,
                   category: str | None = None, metric_type: str | None = None,
-                  limit: int = 500, **_kw):
+                  limit: int = 500, _user=Depends(require_auth)):
     s, e = time_window(time_range, start, end)
     cl = ["timestamp BETWEEN ? AND ?"]
     pa = [s, e]
@@ -791,7 +791,7 @@ def errors_top(project: str | None = None, service: str | None = None,
         GROUP BY message ORDER BY occurrences DESC LIMIT 30""", p)
 
 
-@app.get("/api/health")
+@app.get("/api/health/services")
 def health_services(_user=Depends(require_auth)):
     now = datetime.now(tz=timezone.utc)
     lookback = (now - timedelta(hours=48)).isoformat()

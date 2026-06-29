@@ -15,7 +15,7 @@ export default function Health({ refreshKey }: { refreshKey: number }) {
   const [loading, setLoading] = useState(false);
   useEffect(() => {
     setLoading(true);
-    get("/health").then(setRows).finally(() => setLoading(false));
+    get("/health/services").then(setRows).finally(() => setLoading(false));
   }, [refreshKey]);
 
   const status = (m: number) =>
