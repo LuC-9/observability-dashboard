@@ -1,0 +1,55 @@
+{
+  "summary": "Round-2 verification after iteration_1 fixes. Backend: 37/37 pytest tests pass (added 2 new tests for /api/health/services + 1 for /api/metrics auth requirement; fixed pricing test idempotency with force=True). Frontend: All 10 tabs load without errors. Health and Metrics tabs — both previously broken — now render correctly. Google Sign-in button is properly hidden when /api/config returns empty google_client_id. No regressions on the 32 previously-passing endpoints or other tabs.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "verified_fixes": [
+    "GET /api/metrics/timeseries?time_range=30d -> 200 with rows containing {bucket,k,v} (no more 422 _kw error)",
+    "GET /api/metrics?time_range=30d -> 200 with rows {timestamp,service_name,category,metric_type,value}",
+    "GET /api/metrics and /api/metrics/timeseries -> 401 without Bearer token",
+    "GET /api/health/services with token -> 200 with array of 4 service rows containing service_name,last_seen,minutes_since,traces_48h,error_rate,cost_48h",
+    "GET /api/health (public) -> 200 {status:'ok'} unchanged",
+    "Health.tsx now calls /health/services and renders 4 service rows with status badges (quiet/stale)",
+    "Login.tsx hides Google button since /api/config returns empty google_client_id"
+  ],
+  "regression_verified_endpoints": [
+    "/api/login (success+invalid)", "/api/config", "/api/auth/iap", "/api/health",
+    "/api/filters/projects+platforms+services", "/api/overview", "/api/overview/timeseries", "/api/latency/timeseries",
+    "/api/traces + /api/traces/{id}", "/api/logs (incl. severity filter)",
+    "/api/metrics/catalog + /api/metrics/summary + /api/metrics/timeseries + /api/metrics",
+    "/api/cost (service_name|model|project_id)", "/api/sessions + /api/sessions/{id}",
+    "/api/tools", "/api/search", "/api/top/traces (cost|latency|tokens)", "/api/models",
+    "/api/errors/by-service", "/api/errors/top", "/api/meta/last-refresh",
+    "/api/config/pricing GET+POST+PATCH", "/api/refresh/pipeline + /api/refresh/status (mocked)",
+    "Protected endpoints all return 401 without/with-invalid token"
+  ],
+  "frontend_tabs_verified": [
+    "Overview (KPI tiles + trends ECharts + cost-by-service bar)",
+    "Traces", "Logs", "Metrics (KPI + 2 charts + 26-row raw table)", "LLM Cost",
+    "Sessions", "Tool Calls", "Insights", "Health (4-row service table)", "Compare"
+  ],
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py: /api/health (public) and /api/health/services (auth) cleanly separated — good.",
+    "server.py is 850+ lines — consider splitting into routers (filters, metrics, traces, cost, sessions, insights, pricing) for maintainability.",
+    "DB connection per-query via _conn() opens/closes a SQLite handle on every call — fine for current scale but consider a single shared connection or connection pool for higher throughput.",
+    "Pricing POST/PATCH: PATCH does not validate that pid exists (silently returns ok even if no row updated). Minor; consider verifying rowcount."
+  ],
+  "updated_files": ["/app/backend/tests/backend_test.py"],
+  "success_rate": {"backend": "100% (37/37)", "frontend": "100% (10/10 tabs)"},
+  "test_credentials": "admin1/pwd1 (from /app/memory/test_credentials.md)",
+  "seed_data_creation": "Pricing row TEST_model_x is added by test_pricing_crud (now idempotent via force=True). No other test data created.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "All known issues from iteration_1 are resolved. Frontend now fully functional across all tabs. Backend has comprehensive pytest coverage in /app/backend/tests/backend_test.py. Run `pytest /app/backend/tests/` to regression-test backend in one go. Default time range is 1d in UI."
+}

@@ -257,15 +257,28 @@ def test_errors_top(auth):
 
 
 def test_health_services_with_token(auth):
-    """The /api/health route is defined twice. Authenticated version should return service rows."""
-    r = requests.get(f"{API}/health", headers=auth, timeout=30)
+    """Authenticated /api/health/services should return list of service rows with required fields."""
+    r = requests.get(f"{API}/health/services", headers=auth, timeout=30)
     assert r.status_code == 200
     j = r.json()
-    # If the public {status: ok} wins, this test should detect it as a bug
     assert isinstance(j, list), f"Expected list of services but got: {j}"
-    if j:
-        for f in ["service_name", "last_seen", "minutes_since", "traces_48h", "error_rate"]:
-            assert f in j[0]
+    assert len(j) > 0, "health/services returned empty array"
+    for f in ["service_name", "last_seen", "minutes_since", "traces_48h", "error_rate", "cost_48h"]:
+        assert f in j[0], f"missing {f} in health row: {j[0]}"
+
+
+def test_health_services_requires_auth():
+    """/api/health/services should require Bearer token."""
+    r = requests.get(f"{API}/health/services", timeout=15)
+    assert r.status_code == 401
+
+
+def test_metrics_endpoints_require_auth():
+    """Both /api/metrics and /api/metrics/timeseries should require Bearer token."""
+    r1 = requests.get(f"{API}/metrics?time_range=30d", timeout=15)
+    assert r1.status_code == 401, f"/metrics without token returned {r1.status_code}"
+    r2 = requests.get(f"{API}/metrics/timeseries?time_range=30d", timeout=15)
+    assert r2.status_code == 401, f"/metrics/timeseries without token returned {r2.status_code}"
 
 
 def test_meta_last_refresh(auth):
@@ -282,7 +295,7 @@ def test_pricing_crud(auth):
     assert r.status_code == 200
     assert isinstance(r.json(), list)
 
-    new = {"model_prefix": "TEST_model_x", "input_cost": 1.5, "output_cost": 3.0, "active": True}
+    new = {"model_prefix": "TEST_model_x", "input_cost": 1.5, "output_cost": 3.0, "active": True, "force": True}
     r = requests.post(f"{API}/config/pricing", json=new, headers=auth, timeout=15)
     assert r.status_code == 200, r.text
 
