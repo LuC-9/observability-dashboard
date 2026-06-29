@@ -461,11 +461,16 @@ def traces(project: str | None = None, platform: str | None = None, service: str
 
 @app.get("/api/traces/{trace_id}")
 def trace_detail(trace_id: str, _user=Depends(require_auth)):
-    return run("""SELECT trace_id, span_id, parent_span_id, span_name, span_kind,
-        start_time, end_time, duration_ms, status_code, status_message,
-        service_id AS service_name, agent_name, session_id AS conversation_id,
-        model_id AS model, attributes_json
-        FROM wide_spans_detail WHERE trace_id = ? ORDER BY start_time""", [trace_id])
+    return run("""
+        SELECT trace_id, span_id, parent_span_id, span_name, span_kind,
+               start_time, end_time, duration_ms, status_code, status_message,
+               service_id AS service_name, agent_name,
+               session_id AS conversation_id, model_id AS model,
+               attributes_json
+        FROM wide_spans_detail
+        WHERE trace_id = ?
+        ORDER BY start_time
+    """, [trace_id])
 
 
 # ─── Logs ──────────────────────────────────────────────────────────────────────

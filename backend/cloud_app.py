@@ -123,9 +123,11 @@ def dim_filters(project=None, platform=None, service=None, *, with_platform=True
         params.append(bigquery.ScalarQueryParameter("project", "STRING", project))
     if with_platform:
         c = _multi("environment", platform, "platform", params)
-        if c: clauses.append(c)
+        if c:
+            clauses.append(c)
     c = _multi("service_id", service, "service", params)
-    if c: clauses.append(c)
+    if c:
+        clauses.append(c)
     return clauses, params
 
 
@@ -136,8 +138,10 @@ def _where(*clause_lists) -> str:
 
 def _bucket(time_range: str | None) -> str:
     mins = TIME_PRESETS.get(time_range or "1h", 60)
-    if mins <= 60:    return "MINUTE"
-    if mins <= 1440:  return "HOUR"
+    if mins <= 60:
+        return "MINUTE"
+    if mins <= 1440:
+        return "HOUR"
     return "DAY"
 
 
@@ -465,16 +469,23 @@ def traces(project: str | None = None, platform: str | None = None, service: str
 
 @app.get("/api/traces/{trace_id}")
 def trace_detail(trace_id: str, user=Depends(require_auth)):
+    # 30-day lookback so partitioned tables with require_partition_filter=true
+    # still accept the query. trace_id is the actual selector.
+    lookback = (datetime.datetime.now(datetime.timezone.utc)
+                - datetime.timedelta(days=30)).isoformat()
+    params = [
+        bigquery.ScalarQueryParameter("tid", "STRING", trace_id),
+        bigquery.ScalarQueryParameter("since", "TIMESTAMP", lookback),
+    ]
     return run(f"""
         SELECT trace_id, span_id, parent_span_id, span_name, span_kind,
                start_time, end_time, duration_ms, status_code, status_message,
                service_id  AS service_name, agent_name,
-               session_id  AS conversation_id, model_id AS model,
-               attributes_json
+               session_id  AS conversation_id, model_id AS model
         FROM {SPANS}
-        WHERE trace_id = @tid
+        WHERE start_time >= @since AND trace_id = @tid
         ORDER BY start_time
-    """, [bigquery.ScalarQueryParameter("tid", "STRING", trace_id)])
+    """, params)
 
 
 # ----- logs -------------------------------------------------------------------
@@ -546,7 +557,9 @@ def metrics_catalog(project: str | None = None, service: str | None = None,
         FROM {METRICS} {w}
     """, p)
     out = r[0] if r else {}
-    out.setdefault("states", []); out.setdefault("readiness", []); out.setdefault("response_classes", [])
+    out.setdefault("states", [])
+    out.setdefault("readiness", [])
+    out.setdefault("response_classes", [])
     return out
 
 
@@ -726,7 +739,9 @@ def search(q: str, user=Depends(require_auth)):
     recent = "start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)"
     like = bigquery.ScalarQueryParameter("like", "STRING", f"%{q}%")
     pre  = bigquery.ScalarQueryParameter("pre",  "STRING", f"{q}%")
-    one = lambda sql, prm: [r["v"] for r in run(sql, prm) if r["v"]]
+
+    def one(sql: str, prm: list) -> list:
+        return [r["v"] for r in run(sql, prm) if r["v"]]
     return {
         "projects":      one(f"SELECT DISTINCT project_id AS v FROM {SPANS} WHERE {recent} AND project_id LIKE @like LIMIT 6", [like]),
         "services":      one(f"SELECT DISTINCT service_id AS v FROM {SPANS} WHERE {recent} AND service_id LIKE @like LIMIT 6", [like]),
