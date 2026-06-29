@@ -1,4 +1,7 @@
-# Build context hygiene for `gcloud builds submit`
+.env
+.env.*
+!.env.example
+
 **/node_modules
 **/.venv
 **/__pycache__
@@ -16,3 +19,4 @@ memory
 test_reports
 *.md
 README*
+cloudbuild.yaml

@@ -1,7 +1,16 @@
+# Local-only — never commit
 .env
-.env.*
-*.env
-credentials.json
-*.pem
-*.key
-.credentials
+
+# Build artefacts
+**/node_modules
+**/.venv
+**/__pycache__
+**/*.pyc
+**/dist
+backend/static
+backend/data
+
+# Editor / OS
+.DS_Store
+.idea
+.vscode

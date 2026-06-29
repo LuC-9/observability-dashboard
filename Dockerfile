@@ -1,38 +1,31 @@
 # ── Stage 1: build the React SPA ─────────────────────────────────────────────
 FROM node:20-alpine AS frontend-builder
 WORKDIR /fe
-
-# Install dependencies (uses yarn.lock for reproducible builds)
 COPY frontend/package.json frontend/yarn.lock* ./
 RUN yarn install --frozen-lockfile --silent
-
-# Build — vite.config.ts emits to ../backend/static, i.e. /backend/static
 COPY frontend/ ./
-RUN yarn build
+RUN yarn build   # vite.config.ts writes to ../backend/static → /backend/static
 
 # ── Stage 2: Python runtime ──────────────────────────────────────────────────
 FROM python:3.11-slim
 WORKDIR /app
 
-# Backend deps
 COPY backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Backend source
 COPY backend/ ./backend/
-# .env lives at the project root (so it sits one level above backend/)
-COPY .env ./.env
-
-# Frontend production bundle (index.html + assets/*) — produced in stage 1
 COPY --from=frontend-builder /backend/static ./backend/static
 
-# SQLite DB lives here at runtime — Cloud Run gives us a writable /app
+# Writable spot for SQLite when APP_ENV=local (Cloud Run gives us /app rw)
 RUN mkdir -p /app/data
 ENV DB_PATH=/app/data/local.db
 ENV PORT=7860
 
+# All other config (APP_ENV, GCP_PROJECT, BQ_DATASET, GOOGLE_CLIENT_ID,
+# ALLOWED_DOMAIN, JWT_SECRET, ADMIN_USER, ADMIN_PASS) is injected at deploy
+# time via Cloud Run `--set-env-vars` / `--set-secrets`. We deliberately do
+# NOT COPY .env so the image is environment-agnostic.
+
 WORKDIR /app/backend
 EXPOSE 7860
-
-# Cloud Run injects $PORT — honour it; default to 7860 otherwise.
 CMD ["sh", "-c", "exec uvicorn server:app --host 0.0.0.0 --port ${PORT}"]
