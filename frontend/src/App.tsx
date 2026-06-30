@@ -18,6 +18,7 @@ import Tools from "./views/Tools";
 import Insights from "./views/Insights";
 import Health from "./views/Health";
 import Compare from "./views/Compare";
+import Admin from "./views/Admin";
 
 function loadSettings(): Settings {
   return {
@@ -47,7 +48,7 @@ function writeUrl(scope: Scope, tab: string) {
 }
 
 export default function Root() {
-  const { token } = useAuth();
+  const { token, role, allowedProjects } = useAuth();
   const { message, modal } = AntApp.useApp();
 
   const [settings, setSettings] = useState<Settings>(loadSettings);
@@ -66,6 +67,11 @@ export default function Root() {
   const [bannerKpi, setBannerKpi] = useState<any>({});
 
   useEffect(() => writeUrl(scope, tab), [scope, tab]);
+
+  // Guard: only admins can sit on the Admin tab
+  useEffect(() => {
+    if (tab === "admin" && role && role !== "admin") setTab("overview");
+  }, [tab, role]);
 
   const loadFreshness = useCallback(() => {
     if (token) get("/meta/last-refresh").then(setLastRefresh).catch(() => {});
@@ -148,13 +154,20 @@ export default function Root() {
     insights: <Insights scope={scope} refreshKey={refreshKey} onScope={onScope} />,
     health: <Health refreshKey={refreshKey} />,
     compare: <Compare scope={scope} />,
+    admin: <Admin />,
   };
   const items = [
-    { key: "overview", label: "Overview" }, { key: "traces", label: "Traces" },
-    { key: "logs", label: "Logs" }, { key: "metrics", label: "Metrics" },
-    { key: "cost", label: "LLM Cost" }, { key: "sessions", label: "Sessions" },
-    { key: "tools", label: "Tool Calls" }, { key: "insights", label: "Insights" },
-    { key: "health", label: "Health" }, { key: "compare", label: "Compare" },
+    { key: "overview", label: <span data-testid="tab-overview">Overview</span> },
+    { key: "traces", label: <span data-testid="tab-traces">Traces</span> },
+    { key: "logs", label: <span data-testid="tab-logs">Logs</span> },
+    { key: "metrics", label: <span data-testid="tab-metrics">Metrics</span> },
+    { key: "cost", label: <span data-testid="tab-cost">LLM Cost</span> },
+    { key: "sessions", label: <span data-testid="tab-sessions">Sessions</span> },
+    { key: "tools", label: <span data-testid="tab-tools">Tool Calls</span> },
+    { key: "insights", label: <span data-testid="tab-insights">Insights</span> },
+    { key: "health", label: <span data-testid="tab-health">Health</span> },
+    { key: "compare", label: <span data-testid="tab-compare">Compare</span> },
+    ...(role === "admin" ? [{ key: "admin", label: <span data-testid="tab-admin">Admin</span> }] : []),
   ];
 
   return (
@@ -170,6 +183,16 @@ export default function Root() {
               costBreach ? `Cost $${(bannerKpi.cost_usd || 0).toFixed(4)} > budget $${settings.budgetCost}` : null,
               errBreach ? `Error rate ${((bannerKpi.error_rate || 0) * 100).toFixed(1)}% > ${settings.budgetErr}%` : null,
             ].filter(Boolean).join("   ·   ")} />
+        )}
+        {role === "user" && allowedProjects.length === 0 && (
+          <Alert
+            data-testid="no-project-banner"
+            type="warning"
+            showIcon
+            banner
+            style={{ marginBottom: 8 }}
+            message="No projects assigned to your account. Ask an admin to grant project access."
+          />
         )}
         <FilterBar scope={scope} onChange={setScope} />
         <Tabs activeKey={tab} onChange={setTab} items={items} />

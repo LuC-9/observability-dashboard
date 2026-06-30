@@ -16,7 +16,9 @@ dialect and table names change:
   • <project>.config_ds.llm_pricing         (pricing CRUD — best-effort)
 """
 import datetime
+import json
 import os
+import threading
 from pathlib import Path
 
 import jwt
@@ -42,6 +44,7 @@ LLM      = f"`{PROJECT}.{BQ_DATASET}.wide_llm_interactions_detail`"
 SESSIONS = f"`{PROJECT}.{BQ_DATASET}.wide_sessions_detail`"
 TOOLS    = f"`{PROJECT}.{BQ_DATASET}.wide_tool_executions_detail`"
 PRICING  = f"`{PROJECT}.config_ds.llm_pricing`"
+USERS    = f"`{PROJECT}.config_ds.users`"
 
 WORKFLOW_LOCATION = os.environ.get("WORKFLOW_LOCATION", "us-central1")
 WORKFLOW_NAME     = os.environ.get("WORKFLOW_NAME", "obs-pipeline")
@@ -114,13 +117,27 @@ def _multi(col: str, val: str | None, name: str, params: list):
     return f"{col} IN UNNEST(@{name})"
 
 
-def dim_filters(project=None, platform=None, service=None, *, with_platform=True):
+def dim_filters(project=None, platform=None, service=None, *, with_platform=True,
+                user: dict | None = None):
     """Build WHERE clauses against wide_spans_detail naming:
-       service_name → service_id, source_platform → environment."""
+       service_name → service_id, source_platform → environment.
+
+    When `user` is non-admin, the project filter is restricted to
+    user['allowed_projects']. If `project` is specified, it must be in the
+    allow-list (otherwise 403)."""
     clauses, params = [], []
+    allowed = _allowed_projects(user) if user else None
     if project:
+        if allowed is not None and project not in allowed:
+            raise HTTPException(403, f"no access to project '{project}'")
         clauses.append("project_id = @project")
         params.append(bigquery.ScalarQueryParameter("project", "STRING", project))
+    elif allowed is not None:
+        if not allowed:
+            clauses.append("1 = 0")  # no project access at all
+        else:
+            params.append(bigquery.ArrayQueryParameter("__rbac_projs", "STRING", allowed))
+            clauses.append("project_id IN UNNEST(@__rbac_projs)")
     if with_platform:
         c = _multi("environment", platform, "platform", params)
         if c:
@@ -145,38 +162,125 @@ def _bucket(time_range: str | None) -> str:
     return "DAY"
 
 
-def scope(project, platform, service, time_range, start, end, time_col, with_platform=True):
+def scope(project, platform, service, time_range, start, end, time_col, with_platform=True,
+          user: dict | None = None):
     s, e = time_window(time_range, start, end)
     tcl, tp = time_clause(time_col, s, e)
-    dcl, dp = dim_filters(project, platform, service, with_platform=with_platform)
+    dcl, dp = dim_filters(project, platform, service, with_platform=with_platform, user=user)
     return _where([tcl], dcl), tp + dp, s, e
 
 
-# ─── auth ─────────────────────────────────────────────────────────────────────
+# ─── auth & RBAC (BigQuery-backed users table) ───────────────────────────────
 
 _bearer = HTTPBearer(auto_error=False)
+_users_table_ready = False
+_users_lock = threading.Lock()
 
 
-def make_token(username: str) -> str:
+def _ensure_users_table() -> None:
+    """Lazily create the users table and seed the default admin (ADMIN_USER /
+    ADMIN_PASS) on first call. Idempotent and thread-safe."""
+    global _users_table_ready
+    if _users_table_ready:
+        return
+    with _users_lock:
+        if _users_table_ready:
+            return
+        try:
+            client().query(f"""
+                CREATE TABLE IF NOT EXISTS {USERS} (
+                    username STRING NOT NULL,
+                    password STRING NOT NULL,
+                    role STRING NOT NULL,
+                    allowed_projects STRING NOT NULL,
+                    created_at TIMESTAMP
+                )
+            """).result()
+            # Seed default admin if missing
+            existing = run(f"SELECT COUNT(*) AS n FROM {USERS} WHERE username=@u",
+                           [bigquery.ScalarQueryParameter("u", "STRING", ADMIN_USER)])
+            if existing and existing[0]["n"] == 0:
+                client().query(
+                    f"INSERT INTO {USERS} (username, password, role, allowed_projects, created_at) "
+                    f"VALUES (@u, @p, 'admin', '[]', CURRENT_TIMESTAMP())",
+                    job_config=bigquery.QueryJobConfig(query_parameters=[
+                        bigquery.ScalarQueryParameter("u", "STRING", ADMIN_USER),
+                        bigquery.ScalarQueryParameter("p", "STRING", ADMIN_PASS),
+                    ]),
+                ).result()
+            _users_table_ready = True
+        except Exception as ex:
+            # Don't fence the whole app; just log and let the next request retry.
+            print(f"[cloud_app] users-table bootstrap failed: {ex}")
+
+
+def get_user(username: str) -> dict | None:
+    _ensure_users_table()
+    try:
+        rows = run(f"SELECT username, password, role, allowed_projects FROM {USERS} WHERE username=@u",
+                   [bigquery.ScalarQueryParameter("u", "STRING", username)])
+    except Exception:
+        return None
+    if not rows:
+        return None
+    u = rows[0]
+    try:
+        u["allowed_projects"] = json.loads(u.get("allowed_projects") or "[]")
+    except Exception:
+        u["allowed_projects"] = []
+    return u
+
+
+def make_token(username: str, role: str = "user") -> str:
     now = datetime.datetime.now(datetime.timezone.utc)
-    return jwt.encode({"sub": username, "iat": now,
+    return jwt.encode({"sub": username, "role": role, "iat": now,
                        "exp": now + datetime.timedelta(hours=JWT_TTL_HOURS)},
                       JWT_SECRET, algorithm="HS256")
 
 
-def login(username: str, password: str) -> str:
+def login(username: str, password: str) -> dict:
+    u = get_user(username)
+    if u and u.get("password") == password:
+        return {"token": make_token(u["username"], u["role"]),
+                "user": u["username"], "role": u["role"],
+                "allowed_projects": u["allowed_projects"]}
+    # Fallback: env-seeded admin (covers the very first request before the
+    # users table has been created in BigQuery)
     if username == ADMIN_USER and password == ADMIN_PASS:
-        return make_token(username)
+        _ensure_users_table()
+        return {"token": make_token(username, "admin"), "user": username,
+                "role": "admin", "allowed_projects": []}
     raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid credentials")
 
 
-def require_auth(creds: HTTPAuthorizationCredentials = Depends(_bearer)) -> str:
+def require_auth(creds: HTTPAuthorizationCredentials = Depends(_bearer)) -> dict:
     if creds is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing token")
     try:
-        return jwt.decode(creds.credentials, JWT_SECRET, algorithms=["HS256"])["sub"]
+        payload = jwt.decode(creds.credentials, JWT_SECRET, algorithms=["HS256"])
     except jwt.PyJWTError:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid/expired token")
+    username = payload.get("sub")
+    u = get_user(username) if username else None
+    if u:
+        return {"username": u["username"], "role": u["role"],
+                "allowed_projects": u["allowed_projects"]}
+    if username == ADMIN_USER:
+        return {"username": ADMIN_USER, "role": "admin", "allowed_projects": []}
+    raise HTTPException(status.HTTP_401_UNAUTHORIZED, "user not found")
+
+
+def require_admin(user: dict = Depends(require_auth)) -> dict:
+    if user.get("role") != "admin":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "admin only")
+    return user
+
+
+def _allowed_projects(user: dict) -> list[str] | None:
+    """None means admin (no restriction); otherwise the per-user allow-list."""
+    if user.get("role") == "admin":
+        return None
+    return user.get("allowed_projects") or []
 
 
 # ─── app ──────────────────────────────────────────────────────────────────────
@@ -200,7 +304,12 @@ class Creds(BaseModel):
 
 @app.post("/api/login")
 def do_login(c: Creds):
-    return {"token": login(c.username, c.password), "user": c.username}
+    return login(c.username, c.password)
+
+
+@app.get("/api/me")
+def get_me(user: dict = Depends(require_auth)):
+    return user
 
 
 class GoogleCreds(BaseModel):
@@ -224,7 +333,20 @@ def do_login_google(c: GoogleCreds):
         raise HTTPException(403, f"only {ALLOWED_DOMAIN} accounts allowed")
     if not email:
         raise HTTPException(401, "no email in Google token")
-    return {"token": make_token(email), "user": email}
+    _ensure_users_table()
+    u = get_user(email)
+    if u is None:
+        client().query(
+            f"INSERT INTO {USERS} (username, password, role, allowed_projects, created_at) "
+            f"VALUES (@u, '', 'user', '[]', CURRENT_TIMESTAMP())",
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("u", "STRING", email),
+            ]),
+        ).result()
+        role, allowed = "user", []
+    else:
+        role, allowed = u["role"], u["allowed_projects"]
+    return {"token": make_token(email, role), "user": email, "role": role, "allowed_projects": allowed}
 
 
 @app.get("/api/config")
@@ -240,13 +362,26 @@ def auth_iap(request: Request):
         raise HTTPException(401, "no IAP identity")
     if ALLOWED_DOMAIN and not email.endswith("@" + ALLOWED_DOMAIN):
         raise HTTPException(403, f"only {ALLOWED_DOMAIN} accounts allowed")
-    return {"token": make_token(email), "user": email}
+    _ensure_users_table()
+    u = get_user(email)
+    if u is None:
+        client().query(
+            f"INSERT INTO {USERS} (username, password, role, allowed_projects, created_at) "
+            f"VALUES (@u, '', 'user', '[]', CURRENT_TIMESTAMP())",
+            job_config=bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ScalarQueryParameter("u", "STRING", email),
+            ]),
+        ).result()
+        role, allowed = "user", []
+    else:
+        role, allowed = u["role"], u["allowed_projects"]
+    return {"token": make_token(email, role), "user": email, "role": role, "allowed_projects": allowed}
 
 
 # ----- pricing (best-effort: succeeds only if config_ds.llm_pricing exists) --
 
 @app.get("/api/config/pricing")
-def list_pricing(user=Depends(require_auth)):
+def list_pricing(user: dict = Depends(require_auth)):
     try:
         return run(f"""
             SELECT id, model_prefix,
@@ -269,7 +404,7 @@ class PriceIn(BaseModel):
 
 
 @app.post("/api/config/pricing")
-def add_pricing(p: PriceIn, user=Depends(require_auth)):
+def add_pricing(p: PriceIn, user: dict = Depends(require_auth)):
     prefix = (p.model_prefix or "").strip()
     if not prefix:
         raise HTTPException(400, "model name is required")
@@ -297,7 +432,7 @@ class PricePatch(BaseModel):
 
 
 @app.patch("/api/config/pricing/{pid}")
-def patch_pricing(pid: str, p: PricePatch, user=Depends(require_auth)):
+def patch_pricing(pid: str, p: PricePatch, user: dict = Depends(require_auth)):
     sets, params = [], [bigquery.ScalarQueryParameter("id", "STRING", pid)]
     if p.active is not None:
         sets.append("active=@a")
@@ -318,35 +453,51 @@ def patch_pricing(pid: str, p: PricePatch, user=Depends(require_auth)):
 # ----- filters ----------------------------------------------------------------
 
 @app.get("/api/filters/projects")
-def projects(user=Depends(require_auth)):
+def projects(user: dict = Depends(require_auth)):
+    allowed = _allowed_projects(user)
+    if allowed is None:
+        return run(f"SELECT DISTINCT project_id FROM {SPANS} "
+                   f"WHERE project_id IS NOT NULL ORDER BY project_id")
+    if not allowed:
+        return []
     return run(f"SELECT DISTINCT project_id FROM {SPANS} "
-               f"WHERE project_id IS NOT NULL ORDER BY project_id")
+               f"WHERE project_id IN UNNEST(@__rbac_projs) ORDER BY project_id",
+               [bigquery.ArrayQueryParameter("__rbac_projs", "STRING", allowed)])
 
 
 @app.get("/api/filters/platforms")
-def platforms(project: str | None = None, user=Depends(require_auth)):
-    cl, p = dim_filters(project, None, None, with_platform=False)
+def platforms(project: str | None = None, user: dict = Depends(require_auth)):
+    cl, p = dim_filters(project, None, None, with_platform=False, user=user)
     return run(f"SELECT DISTINCT environment AS source_platform FROM {SPANS} {_where(cl)} "
                f"{'AND' if cl else 'WHERE'} environment IS NOT NULL ORDER BY source_platform", p)
 
 
 @app.get("/api/filters/services")
-def services(project: str | None = None, platform: str | None = None, user=Depends(require_auth)):
-    cl, p = dim_filters(project, platform, None)
+def services(project: str | None = None, platform: str | None = None, user: dict = Depends(require_auth)):
+    cl, p = dim_filters(project, platform, None, user=user)
     return run(f"SELECT DISTINCT service_id AS service_name FROM {SPANS} {_where(cl)} "
                f"{'AND' if cl else 'WHERE'} service_id IS NOT NULL ORDER BY service_name", p)
 
 
 # ----- overview ---------------------------------------------------------------
 
-def _llm_window(s: str, e: str, project, platform, service):
+def _llm_window(s: str, e: str, project, platform, service, user: dict | None = None):
     """WHERE conditions for wide_llm_interactions_detail in the same window."""
     cl = ["timestamp BETWEEN @start_ts AND @end_ts"]
     params = [bigquery.ScalarQueryParameter("start_ts", "TIMESTAMP", s),
               bigquery.ScalarQueryParameter("end_ts",   "TIMESTAMP", e)]
+    allowed = _allowed_projects(user) if user else None
     if project:
+        if allowed is not None and project not in allowed:
+            raise HTTPException(403, f"no access to project '{project}'")
         cl.append("project_id = @project")
         params.append(bigquery.ScalarQueryParameter("project", "STRING", project))
+    elif allowed is not None:
+        if not allowed:
+            cl.append("1 = 0")
+        else:
+            cl.append("project_id IN UNNEST(@__rbac_projs_llm)")
+            params.append(bigquery.ArrayQueryParameter("__rbac_projs_llm", "STRING", allowed))
     if platform:
         plats = [p for p in platform.split(",") if p]
         if len(plats) == 1:
@@ -369,8 +520,8 @@ def _llm_window(s: str, e: str, project, platform, service):
 @app.get("/api/overview")
 def overview(project: str | None = None, platform: str | None = None, service: str | None = None,
              time_range: str = "1h", start: str | None = None, end: str | None = None,
-             user=Depends(require_auth)):
-    w, p, s, e = scope(project, platform, service, time_range, start, end, "start_time")
+             user: dict = Depends(require_auth)):
+    w, p, s, e = scope(project, platform, service, time_range, start, end, "start_time", user=user)
     span_kpi = run(f"""
         SELECT
           COUNT(DISTINCT trace_id) AS traces,
@@ -382,7 +533,7 @@ def overview(project: str | None = None, platform: str | None = None, service: s
           ROUND(APPROX_QUANTILES(IF(parent_span_id IS NULL, duration_ms, NULL), 100)[OFFSET(95)],1) AS p95_ms
         FROM {SPANS} {w}
     """, p)
-    llm_w, llm_p = _llm_window(s, e, project, platform, service)
+    llm_w, llm_p = _llm_window(s, e, project, platform, service, user=user)
     llm_kpi = run(f"""
         SELECT
           ROUND(COALESCE(SUM(cost), 0), 6) AS cost_usd,
@@ -399,8 +550,8 @@ def overview(project: str | None = None, platform: str | None = None, service: s
 @app.get("/api/overview/timeseries")
 def overview_ts(project: str | None = None, platform: str | None = None, service: str | None = None,
                 time_range: str = "1h", start: str | None = None, end: str | None = None,
-                user=Depends(require_auth)):
-    w, p, s, e = scope(project, platform, service, time_range, start, end, "start_time")
+                user: dict = Depends(require_auth)):
+    w, p, s, e = scope(project, platform, service, time_range, start, end, "start_time", user=user)
     b = _bucket(time_range)
     spans = run(f"""
         SELECT TIMESTAMP_TRUNC(start_time, {b}) AS bucket,
@@ -409,7 +560,7 @@ def overview_ts(project: str | None = None, platform: str | None = None, service
         FROM {SPANS} {w}
         GROUP BY bucket
     """, p)
-    llm_w, llm_p = _llm_window(s, e, project, platform, service)
+    llm_w, llm_p = _llm_window(s, e, project, platform, service, user=user)
     llm = run(f"""
         SELECT TIMESTAMP_TRUNC(timestamp, {b}) AS bucket,
                ROUND(COALESCE(SUM(cost),0),6)  AS cost_usd,
@@ -434,8 +585,8 @@ def overview_ts(project: str | None = None, platform: str | None = None, service
 @app.get("/api/latency/timeseries")
 def latency_ts(project: str | None = None, platform: str | None = None, service: str | None = None,
                time_range: str = "1h", start: str | None = None, end: str | None = None,
-               user=Depends(require_auth)):
-    w, p, _, _ = scope(project, platform, service, time_range, start, end, "start_time")
+               user: dict = Depends(require_auth)):
+    w, p, _, _ = scope(project, platform, service, time_range, start, end, "start_time", user=user)
     b = _bucket(time_range)
     return run(f"""
         SELECT TIMESTAMP_TRUNC(start_time, {b}) AS bucket,
@@ -451,8 +602,8 @@ def latency_ts(project: str | None = None, platform: str | None = None, service:
 @app.get("/api/traces")
 def traces(project: str | None = None, platform: str | None = None, service: str | None = None,
            time_range: str = "1h", start: str | None = None, end: str | None = None,
-           page: int = 1, page_size: int = 50, user=Depends(require_auth)):
-    w, p, _, _ = scope(project, platform, service, time_range, start, end, "start_time")
+           page: int = 1, page_size: int = 50, user: dict = Depends(require_auth)):
+    w, p, _, _ = scope(project, platform, service, time_range, start, end, "start_time", user=user)
     total = run(f"SELECT COUNT(*) AS n FROM (SELECT trace_id FROM {SPANS} {w} GROUP BY trace_id)", p)
     off = (max(1, page) - 1) * page_size
     rows = run(f"""
@@ -492,7 +643,7 @@ def traces(project: str | None = None, platform: str | None = None, service: str
 
 
 @app.get("/api/traces/{trace_id}")
-def trace_detail(trace_id: str, user=Depends(require_auth)):
+def trace_detail(trace_id: str, user: dict = Depends(require_auth)):
     # 30-day lookback so partitioned tables with require_partition_filter=true
     # still accept the query. trace_id is the actual selector.
     lookback = (datetime.datetime.now(datetime.timezone.utc)
@@ -501,13 +652,24 @@ def trace_detail(trace_id: str, user=Depends(require_auth)):
         bigquery.ScalarQueryParameter("tid", "STRING", trace_id),
         bigquery.ScalarQueryParameter("since", "TIMESTAMP", lookback),
     ]
+    allowed = _allowed_projects(user)
+    extra = ""
+    if allowed is not None:
+        if not allowed:
+            raise HTTPException(403, "no project access")
+        params.append(bigquery.ArrayQueryParameter("__rbac_projs_td", "STRING", allowed))
+        extra = " AND project_id IN UNNEST(@__rbac_projs_td)"
+        chk = run(f"SELECT COUNT(*) AS n FROM {SPANS} "
+                  f"WHERE start_time >= @since AND trace_id = @tid{extra}", params)
+        if not chk or chk[0]["n"] == 0:
+            raise HTTPException(403, "no access to this trace")
     return run(f"""
         SELECT trace_id, span_id, parent_span_id, span_name, span_kind,
                start_time, end_time, duration_ms, status_code, status_message,
                service_id  AS service_name, agent_name,
                session_id  AS conversation_id, model_id AS model
         FROM {SPANS}
-        WHERE start_time >= @since AND trace_id = @tid
+        WHERE start_time >= @since AND trace_id = @tid{extra}
         ORDER BY start_time
     """, params)
 
@@ -517,15 +679,24 @@ def trace_detail(trace_id: str, user=Depends(require_auth)):
 @app.get("/api/logs")
 def logs(project: str | None = None, service: str | None = None, severity: str | None = None,
          time_range: str = "1h", start: str | None = None, end: str | None = None,
-         page: int = 1, page_size: int = 50, user=Depends(require_auth)):
+         page: int = 1, page_size: int = 50, user: dict = Depends(require_auth)):
     s, e = time_window(time_range, start, end)
     cl, params = ["timestamp BETWEEN @start_ts AND @end_ts"], [
         bigquery.ScalarQueryParameter("start_ts", "TIMESTAMP", s),
         bigquery.ScalarQueryParameter("end_ts",   "TIMESTAMP", e),
     ]
+    allowed = _allowed_projects(user)
     if project:
+        if allowed is not None and project not in allowed:
+            raise HTTPException(403, f"no access to project '{project}'")
         cl.append("project_id = @project")
         params.append(bigquery.ScalarQueryParameter("project", "STRING", project))
+    elif allowed is not None:
+        if not allowed:
+            cl.append("1 = 0")
+        else:
+            cl.append("project_id IN UNNEST(@__rbac_projs_logs)")
+            params.append(bigquery.ArrayQueryParameter("__rbac_projs_logs", "STRING", allowed))
     if service:
         cl.append("service_id = @service")
         params.append(bigquery.ScalarQueryParameter("service", "STRING", service))
@@ -548,14 +719,23 @@ def logs(project: str | None = None, service: str | None = None, severity: str |
 # ----- metrics ----------------------------------------------------------------
 
 def _metric_scope(project, service, time_range, start, end,
-                  category=None, metric_type=None):
+                  category=None, metric_type=None, user: dict | None = None):
     s, e = time_window(time_range, start, end)
     cl = ["timestamp BETWEEN @start_ts AND @end_ts"]
     params = [bigquery.ScalarQueryParameter("start_ts", "TIMESTAMP", s),
               bigquery.ScalarQueryParameter("end_ts",   "TIMESTAMP", e)]
+    allowed = _allowed_projects(user) if user else None
     if project:
+        if allowed is not None and project not in allowed:
+            raise HTTPException(403, f"no access to project '{project}'")
         cl.append("project_id = @project")
         params.append(bigquery.ScalarQueryParameter("project", "STRING", project))
+    elif allowed is not None:
+        if not allowed:
+            cl.append("1 = 0")
+        else:
+            cl.append("project_id IN UNNEST(@__rbac_projs_m)")
+            params.append(bigquery.ArrayQueryParameter("__rbac_projs_m", "STRING", allowed))
     if service:
         cl.append("service_id = @service")
         params.append(bigquery.ScalarQueryParameter("service", "STRING", service))
@@ -571,8 +751,8 @@ def _metric_scope(project, service, time_range, start, end,
 @app.get("/api/metrics/catalog")
 def metrics_catalog(project: str | None = None, service: str | None = None,
                     time_range: str = "1h", start: str | None = None, end: str | None = None,
-                    user=Depends(require_auth)):
-    w, p, _, _ = _metric_scope(project, service, time_range, start, end)
+                    user: dict = Depends(require_auth)):
+    w, p, _, _ = _metric_scope(project, service, time_range, start, end, user=user)
     r = run(f"""
         SELECT
           ARRAY_AGG(DISTINCT metric_type IGNORE NULLS ORDER BY metric_type) AS categories,
@@ -591,8 +771,8 @@ def metrics_catalog(project: str | None = None, service: str | None = None,
 def metrics_summary(project: str | None = None, service: str | None = None,
                     time_range: str = "1h", start: str | None = None, end: str | None = None,
                     state: str | None = None, readiness: str | None = None, rclass: str | None = None,
-                    user=Depends(require_auth)):
-    w, p, _, _ = _metric_scope(project, service, time_range, start, end)
+                    user: dict = Depends(require_auth)):
+    w, p, _, _ = _metric_scope(project, service, time_range, start, end, user=user)
     r = run(f"""
         SELECT
           COALESCE(SUM(CASE WHEN metric_name='gen_ai.client.token.usage' THEN value_int ELSE 0 END), 0) AS total_requests,
@@ -610,8 +790,8 @@ def metrics_ts(category: str | None = None, group: str | None = None, agg: str |
                metric_type: str | None = None,
                project: str | None = None, service: str | None = None,
                time_range: str = "1h", start: str | None = None, end: str | None = None,
-               user=Depends(require_auth)):
-    w, p, _, _ = _metric_scope(project, service, time_range, start, end, category, metric_type)
+               user: dict = Depends(require_auth)):
+    w, p, _, _ = _metric_scope(project, service, time_range, start, end, category, metric_type, user=user)
     b = _bucket(time_range)
     grp_col = "service_id" if group != "none" else "'all'"
     agg_fn = {"sum": "SUM", "avg": "AVG", "max": "MAX"}.get(agg or "avg", "AVG")
@@ -628,8 +808,8 @@ def metrics_ts(category: str | None = None, group: str | None = None, agg: str |
 def metrics_table(project: str | None = None, service: str | None = None,
                   time_range: str = "1h", start: str | None = None, end: str | None = None,
                   category: str | None = None, metric_type: str | None = None,
-                  limit: int = 500, user=Depends(require_auth)):
-    w, p, _, _ = _metric_scope(project, service, time_range, start, end, category, metric_type)
+                  limit: int = 500, user: dict = Depends(require_auth)):
+    w, p, _, _ = _metric_scope(project, service, time_range, start, end, category, metric_type, user=user)
     return run(f"""
         SELECT timestamp, service_id AS service_name, project_id, environment,
                metric_type AS category, metric_name AS metric_type,
@@ -648,14 +828,14 @@ def metrics_table(project: str | None = None, service: str | None = None,
 def cost(group_by: str = "service_name",
          project: str | None = None, platform: str | None = None, service: str | None = None,
          time_range: str = "1h", start: str | None = None, end: str | None = None,
-         user=Depends(require_auth)):
+         user: dict = Depends(require_auth)):
     allowed = {"service_name": "service_id", "model": "model_name",
                "project_id": "project_id", "source_platform": "environment"}
     if group_by not in allowed:
         raise HTTPException(400, f"group_by must be one of {sorted(allowed)}")
     col = allowed[group_by]
     s, e = time_window(time_range, start, end)
-    llm_w, llm_p = _llm_window(s, e, project, platform, service)
+    llm_w, llm_p = _llm_window(s, e, project, platform, service, user=user)
     return run(f"""
         SELECT {col} AS key,
                ROUND(COALESCE(SUM(cost),0),6) AS cost_usd,
@@ -671,8 +851,8 @@ def cost(group_by: str = "service_name",
 @app.get("/api/sessions")
 def sessions_list(project: str | None = None, platform: str | None = None, service: str | None = None,
                   time_range: str = "1h", start: str | None = None, end: str | None = None,
-                  limit: int = 200, user=Depends(require_auth)):
-    w, p, _, _ = scope(project, platform, service, time_range, start, end, "start_time")
+                  limit: int = 200, user: dict = Depends(require_auth)):
+    w, p, _, _ = scope(project, platform, service, time_range, start, end, "start_time", user=user)
     rows = run(f"""
         SELECT session_id AS conversation_id,
                ANY_VALUE(service_id)    AS service_name,
@@ -700,14 +880,25 @@ def sessions_list(project: str | None = None, platform: str | None = None, servi
 
 
 @app.get("/api/sessions/{conversation_id}")
-def session_detail(conversation_id: str, user=Depends(require_auth)):
+def session_detail(conversation_id: str, user: dict = Depends(require_auth)):
+    allowed = _allowed_projects(user)
+    extra_w = ""
+    qparams = [bigquery.ScalarQueryParameter("cid", "STRING", conversation_id)]
+    if allowed is not None:
+        if not allowed:
+            raise HTTPException(403, "no project access")
+        qparams.append(bigquery.ArrayQueryParameter("__rbac_projs_sd", "STRING", allowed))
+        extra_w = " AND project_id IN UNNEST(@__rbac_projs_sd)"
+        chk = run(f"SELECT COUNT(*) AS n FROM {SPANS} WHERE session_id = @cid{extra_w}", qparams)
+        if not chk or chk[0]["n"] == 0:
+            raise HTTPException(403, "no access to this session")
     rows = run(f"""
         SELECT trace_id, ANY_VALUE(service_id) AS service_name, MIN(start_time) AS start_time,
                MAX(IF(parent_span_id IS NULL, span_name, NULL)) AS root_span,
                MAX(IF(parent_span_id IS NULL, duration_ms, NULL)) AS duration_ms
-        FROM {SPANS} WHERE session_id = @cid
+        FROM {SPANS} WHERE session_id = @cid{extra_w}
         GROUP BY trace_id ORDER BY start_time
-    """, [bigquery.ScalarQueryParameter("cid", "STRING", conversation_id)])
+    """, qparams)
     if rows:
         tids = [r["trace_id"] for r in rows]
         llm = run(f"""
@@ -729,7 +920,7 @@ def session_detail(conversation_id: str, user=Depends(require_auth)):
 @app.get("/api/tools")
 def tools(project: str | None = None, platform: str | None = None, service: str | None = None,
           time_range: str = "1h", start: str | None = None, end: str | None = None,
-          user=Depends(require_auth)):
+          user: dict = Depends(require_auth)):
     s, e = time_window(time_range, start, end)
     cl, params = ["timestamp BETWEEN @start_ts AND @end_ts"], [
         bigquery.ScalarQueryParameter("start_ts", "TIMESTAMP", s),
@@ -757,21 +948,29 @@ def tools(project: str | None = None, platform: str | None = None, service: str 
 
 
 @app.get("/api/search")
-def search(q: str, user=Depends(require_auth)):
+def search(q: str, user: dict = Depends(require_auth)):
     if not q or len(q) < 2:
         return {}
     recent = "start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)"
+    allowed = _allowed_projects(user)
+    extra = ""
+    extra_p: list = []
+    if allowed is not None:
+        if not allowed:
+            return {"projects": [], "services": [], "models": [], "traces": [], "conversations": []}
+        extra = " AND project_id IN UNNEST(@__rbac_projs_s)"
+        extra_p = [bigquery.ArrayQueryParameter("__rbac_projs_s", "STRING", allowed)]
     like = bigquery.ScalarQueryParameter("like", "STRING", f"%{q}%")
     pre  = bigquery.ScalarQueryParameter("pre",  "STRING", f"{q}%")
 
     def one(sql: str, prm: list) -> list:
         return [r["v"] for r in run(sql, prm) if r["v"]]
     return {
-        "projects":      one(f"SELECT DISTINCT project_id AS v FROM {SPANS} WHERE {recent} AND project_id LIKE @like LIMIT 6", [like]),
-        "services":      one(f"SELECT DISTINCT service_id AS v FROM {SPANS} WHERE {recent} AND service_id LIKE @like LIMIT 6", [like]),
-        "models":        one(f"SELECT DISTINCT model_id  AS v FROM {SPANS} WHERE {recent} AND model_id  LIKE @like LIMIT 6", [like]),
-        "traces":        one(f"SELECT DISTINCT trace_id  AS v FROM {SPANS} WHERE {recent} AND STARTS_WITH(trace_id, @pre) LIMIT 6", [pre]),
-        "conversations": one(f"SELECT DISTINCT session_id AS v FROM {SPANS} WHERE {recent} AND session_id LIKE @like LIMIT 6", [like]),
+        "projects":      one(f"SELECT DISTINCT project_id AS v FROM {SPANS} WHERE {recent} AND project_id LIKE @like{extra} LIMIT 6", [like] + extra_p),
+        "services":      one(f"SELECT DISTINCT service_id AS v FROM {SPANS} WHERE {recent} AND service_id LIKE @like{extra} LIMIT 6", [like] + extra_p),
+        "models":        one(f"SELECT DISTINCT model_id  AS v FROM {SPANS} WHERE {recent} AND model_id  LIKE @like{extra} LIMIT 6", [like] + extra_p),
+        "traces":        one(f"SELECT DISTINCT trace_id  AS v FROM {SPANS} WHERE {recent} AND STARTS_WITH(trace_id, @pre){extra} LIMIT 6", [pre] + extra_p),
+        "conversations": one(f"SELECT DISTINCT session_id AS v FROM {SPANS} WHERE {recent} AND session_id LIKE @like{extra} LIMIT 6", [like] + extra_p),
     }
 
 
@@ -779,8 +978,8 @@ def search(q: str, user=Depends(require_auth)):
 def top_traces(by: str = "cost",
                project: str | None = None, platform: str | None = None, service: str | None = None,
                time_range: str = "1h", start: str | None = None, end: str | None = None,
-               limit: int = 20, user=Depends(require_auth)):
-    w, p, s, e = scope(project, platform, service, time_range, start, end, "start_time")
+               limit: int = 20, user: dict = Depends(require_auth)):
+    w, p, s, e = scope(project, platform, service, time_range, start, end, "start_time", user=user)
     spans = run(f"""
         SELECT trace_id,
                ANY_VALUE(service_id) AS service_name,
@@ -813,9 +1012,9 @@ def top_traces(by: str = "cost",
 @app.get("/api/models")
 def models(project: str | None = None, platform: str | None = None, service: str | None = None,
            time_range: str = "1h", start: str | None = None, end: str | None = None,
-           user=Depends(require_auth)):
+           user: dict = Depends(require_auth)):
     s, e = time_window(time_range, start, end)
-    llm_w, llm_p = _llm_window(s, e, project, platform, service)
+    llm_w, llm_p = _llm_window(s, e, project, platform, service, user=user)
     return run(f"""
         SELECT model_name AS model,
                COUNT(*) AS calls,
@@ -832,8 +1031,8 @@ def models(project: str | None = None, platform: str | None = None, service: str
 @app.get("/api/errors/by-service")
 def errors_by_service(project: str | None = None, platform: str | None = None, service: str | None = None,
                       time_range: str = "1h", start: str | None = None, end: str | None = None,
-                      user=Depends(require_auth)):
-    w, p, _, _ = scope(project, platform, service, time_range, start, end, "start_time")
+                      user: dict = Depends(require_auth)):
+    w, p, _, _ = scope(project, platform, service, time_range, start, end, "start_time", user=user)
     return run(f"""
         SELECT service_id AS service_name,
                COUNT(*) AS spans,
@@ -847,15 +1046,24 @@ def errors_by_service(project: str | None = None, platform: str | None = None, s
 @app.get("/api/errors/top")
 def errors_top(project: str | None = None, service: str | None = None,
                time_range: str = "1h", start: str | None = None, end: str | None = None,
-               user=Depends(require_auth)):
+               user: dict = Depends(require_auth)):
     s, e = time_window(time_range, start, end)
     cl, params = ["timestamp BETWEEN @start_ts AND @end_ts"], [
         bigquery.ScalarQueryParameter("start_ts", "TIMESTAMP", s),
         bigquery.ScalarQueryParameter("end_ts",   "TIMESTAMP", e),
     ]
+    allowed = _allowed_projects(user)
     if project:
+        if allowed is not None and project not in allowed:
+            raise HTTPException(403, f"no access to project '{project}'")
         cl.append("project_id = @project")
         params.append(bigquery.ScalarQueryParameter("project", "STRING", project))
+    elif allowed is not None:
+        if not allowed:
+            cl.append("1 = 0")
+        else:
+            cl.append("project_id IN UNNEST(@__rbac_projs_err)")
+            params.append(bigquery.ArrayQueryParameter("__rbac_projs_err", "STRING", allowed))
     if service:
         cl.append("service_id = @service")
         params.append(bigquery.ScalarQueryParameter("service", "STRING", service))
@@ -869,7 +1077,14 @@ def errors_top(project: str | None = None, service: str | None = None,
 
 
 @app.get("/api/health/services")
-def health_services(user=Depends(require_auth)):
+def health_services(user: dict = Depends(require_auth)):
+    allowed = _allowed_projects(user)
+    extra_w, extra_p = "", []
+    if allowed is not None:
+        if not allowed:
+            return []
+        extra_w = " AND project_id IN UNNEST(@__rbac_projs_hs)"
+        extra_p = [bigquery.ArrayQueryParameter("__rbac_projs_hs", "STRING", allowed)]
     rows = run(f"""
         SELECT service_id AS service_name,
                ANY_VALUE(environment) AS platform,
@@ -879,9 +1094,9 @@ def health_services(user=Depends(require_auth)):
                COUNT(DISTINCT trace_id) AS traces_48h,
                ROUND(SAFE_DIVIDE(COUNTIF(status_code='ERROR'), COUNT(*)), 4) AS error_rate
         FROM {SPANS}
-        WHERE start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 48 HOUR)
+        WHERE start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 48 HOUR){extra_w}
         GROUP BY service_id ORDER BY last_seen DESC
-    """)
+    """, extra_p)
     if rows:
         sids = [r["service_name"] for r in rows]
         llm = run(f"""
@@ -899,7 +1114,7 @@ def health_services(user=Depends(require_auth)):
 
 
 @app.get("/api/meta/last-refresh")
-def last_refresh(user=Depends(require_auth)):
+def last_refresh(user: dict = Depends(require_auth)):
     out = {}
     for name, tbl, col in (("spans", SPANS, "start_time"),
                            ("logs",  LOGS,  "timestamp"),
@@ -913,7 +1128,7 @@ def last_refresh(user=Depends(require_auth)):
 
 
 @app.post("/api/refresh/pipeline")
-def refresh_pipeline(user=Depends(require_auth)):
+def refresh_pipeline(user: dict = Depends(require_auth)):
     try:
         from google.cloud.workflows.executions_v1 import ExecutionsClient
         c = ExecutionsClient()
@@ -925,13 +1140,109 @@ def refresh_pipeline(user=Depends(require_auth)):
 
 
 @app.get("/api/refresh/status")
-def refresh_status(execution: str, user=Depends(require_auth)):
+def refresh_status(execution: str, user: dict = Depends(require_auth)):
     try:
         from google.cloud.workflows.executions_v1 import ExecutionsClient
         ex = ExecutionsClient().get_execution(name=execution)
         return {"state": ex.state.name}
     except Exception as ex:
         raise HTTPException(500, f"could not read execution: {ex}")
+
+
+# ─── Admin: RBAC user management (BigQuery-backed) ────────────────────────────
+
+class UserIn(BaseModel):
+    username: str
+    password: str
+    role: str = "user"
+    allowed_projects: list[str] = []
+
+
+class UserPatch(BaseModel):
+    password: str | None = None
+    role: str | None = None
+    allowed_projects: list[str] | None = None
+
+
+@app.get("/api/admin/users")
+def admin_list_users(_admin: dict = Depends(require_admin)):
+    _ensure_users_table()
+    rows = run(f"SELECT username, role, allowed_projects, created_at FROM {USERS} ORDER BY username")
+    for r in rows:
+        try:
+            r["allowed_projects"] = json.loads(r.get("allowed_projects") or "[]")
+        except Exception:
+            r["allowed_projects"] = []
+    return rows
+
+
+@app.post("/api/admin/users")
+def admin_create_user(u: UserIn, _admin: dict = Depends(require_admin)):
+    if not u.username.strip() or not u.password:
+        raise HTTPException(400, "username and password are required")
+    if u.role not in ("admin", "user"):
+        raise HTTPException(400, "role must be 'admin' or 'user'")
+    _ensure_users_table()
+    if get_user(u.username):
+        raise HTTPException(409, "user already exists")
+    client().query(
+        f"INSERT INTO {USERS} (username, password, role, allowed_projects, created_at) "
+        f"VALUES (@u, @p, @r, @ap, CURRENT_TIMESTAMP())",
+        job_config=bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("u", "STRING", u.username.strip()),
+            bigquery.ScalarQueryParameter("p", "STRING", u.password),
+            bigquery.ScalarQueryParameter("r", "STRING", u.role),
+            bigquery.ScalarQueryParameter("ap", "STRING", json.dumps(u.allowed_projects or [])),
+        ]),
+    ).result()
+    return {"ok": True}
+
+
+@app.patch("/api/admin/users/{username}")
+def admin_update_user(username: str, u: UserPatch, admin: dict = Depends(require_admin)):
+    _ensure_users_table()
+    if not get_user(username):
+        raise HTTPException(404, "user not found")
+    sets, params = [], [bigquery.ScalarQueryParameter("u", "STRING", username)]
+    if u.password is not None:
+        sets.append("password=@p")
+        params.append(bigquery.ScalarQueryParameter("p", "STRING", u.password))
+    if u.role is not None:
+        if u.role not in ("admin", "user"):
+            raise HTTPException(400, "role must be 'admin' or 'user'")
+        if username == admin["username"] and u.role != "admin":
+            raise HTTPException(400, "cannot demote your own admin role")
+        sets.append("role=@r")
+        params.append(bigquery.ScalarQueryParameter("r", "STRING", u.role))
+    if u.allowed_projects is not None:
+        sets.append("allowed_projects=@ap")
+        params.append(bigquery.ScalarQueryParameter("ap", "STRING", json.dumps(u.allowed_projects)))
+    if not sets:
+        raise HTTPException(400, "nothing to update")
+    client().query(f"UPDATE {USERS} SET {', '.join(sets)} WHERE username=@u",
+                   job_config=bigquery.QueryJobConfig(query_parameters=params)).result()
+    return {"ok": True}
+
+
+@app.delete("/api/admin/users/{username}")
+def admin_delete_user(username: str, admin: dict = Depends(require_admin)):
+    if username == admin["username"]:
+        raise HTTPException(400, "cannot delete yourself")
+    _ensure_users_table()
+    if not get_user(username):
+        raise HTTPException(404, "user not found")
+    client().query(f"DELETE FROM {USERS} WHERE username=@u",
+                   job_config=bigquery.QueryJobConfig(query_parameters=[
+                       bigquery.ScalarQueryParameter("u", "STRING", username),
+                   ])).result()
+    return {"ok": True}
+
+
+@app.get("/api/admin/projects")
+def admin_all_projects(_admin: dict = Depends(require_admin)):
+    """Every project_id in spans, unfiltered (for assignment UI)."""
+    return run(f"SELECT DISTINCT project_id FROM {SPANS} "
+               f"WHERE project_id IS NOT NULL ORDER BY project_id")
 
 
 # ─── SPA mount ────────────────────────────────────────────────────────────────

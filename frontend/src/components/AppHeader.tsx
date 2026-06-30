@@ -30,7 +30,7 @@ export default function AppHeader({
   onOpenSettings: () => void;
   onOpenSearch: () => void;
 }) {
-  const { logout, user } = useAuth();
+  const { logout, user, role } = useAuth();
   const newest = Object.values(lastRefresh).filter(Boolean).sort().slice(-1)[0];
   const isMac = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform);
   const kbd = isMac ? "⌘K" : "Ctrl+K";
@@ -70,7 +70,12 @@ export default function AppHeader({
         <Tooltip title="Knobs, dials, fonts & timezones.">
           <Button type="text" icon={<SettingOutlined style={{ color: "#fff" }} />} onClick={onOpenSettings} />
         </Tooltip>
-        <Typography.Text style={{ color: "#888" }}>{user}</Typography.Text>
+        <Typography.Text style={{ color: "#888" }} data-testid="header-user">{user}</Typography.Text>
+        {role && (
+          <Tag color={role === "admin" ? "gold" : "blue"} data-testid="header-role">
+            {role.toUpperCase()}
+          </Tag>
+        )}
         <Tooltip title="Escape hatch.">
           <Button type="text" icon={<LogoutOutlined style={{ color: "#fff" }} />} onClick={logout} />
         </Tooltip>

@@ -3,6 +3,7 @@ Central Observability API — SQLite-backed (wide_* schema from obswebapp).
 Exposes the same endpoints expected by the dashboard frontend.
 """
 import os
+import json
 import sqlite3
 import uuid
 import random
@@ -67,6 +68,18 @@ def bootstrap_db():
         c.execute('''CREATE TABLE IF NOT EXISTS "llm_pricing" (
             id TEXT PRIMARY KEY, model_prefix TEXT, input_cost_per_1m_tokens REAL,
             output_cost_per_1m_tokens REAL, active INTEGER DEFAULT 1, updated_at TEXT)''')
+        # users table for RBAC
+        c.execute('''CREATE TABLE IF NOT EXISTS "users" (
+            username TEXT PRIMARY KEY,
+            password TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user',
+            allowed_projects TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT)''')
+        # seed default admin if missing
+        cur = c.execute("SELECT COUNT(*) FROM users WHERE username = ?", (ADMIN_USER,))
+        if cur.fetchone()[0] == 0:
+            c.execute("INSERT INTO users (username, password, role, allowed_projects, created_at) VALUES (?,?,?,?,?)",
+                      (ADMIN_USER, ADMIN_PASS, 'admin', '[]', datetime.now(tz=timezone.utc).isoformat()))
         c.commit()
 
     # idempotent: only seed if spans empty
@@ -120,19 +133,76 @@ def bootstrap_db():
 
 # ─── Auth helpers ─────────────────────────────────────────────────────────────
 
-def make_token(user: str) -> str:
-    payload = {"sub": user, "exp": datetime.now(tz=timezone.utc) + timedelta(hours=24)}
+def get_user(username: str) -> dict | None:
+    rows = run("SELECT username, password, role, allowed_projects FROM users WHERE username = ?", [username])
+    if not rows:
+        return None
+    u = rows[0]
+    try:
+        u["allowed_projects"] = json.loads(u["allowed_projects"] or "[]")
+    except Exception:
+        u["allowed_projects"] = []
+    return u
+
+
+def make_token(user: str, role: str = "user") -> str:
+    payload = {
+        "sub": user,
+        "role": role,
+        "exp": datetime.now(tz=timezone.utc) + timedelta(hours=24),
+    }
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
 
-def require_auth(authorization: str | None = Header(None)):
+def require_auth(authorization: str | None = Header(None)) -> dict:
+    """Returns dict {username, role, allowed_projects}."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "missing token")
     try:
         payload = jwt.decode(authorization.split(" ", 1)[1], JWT_SECRET, algorithms=["HS256"])
-        return payload.get("sub")
     except jwt.PyJWTError:
         raise HTTPException(401, "invalid token")
+    username = payload.get("sub")
+    u = get_user(username) if username else None
+    if not u:
+        # Allow tokens that match the env-seeded admin even before DB has the row.
+        if username == ADMIN_USER:
+            return {"username": ADMIN_USER, "role": "admin", "allowed_projects": []}
+        raise HTTPException(401, "user not found")
+    return {"username": u["username"], "role": u["role"], "allowed_projects": u["allowed_projects"]}
+
+
+def require_admin(user: dict = Depends(require_auth)) -> dict:
+    if user.get("role") != "admin":
+        raise HTTPException(403, "admin only")
+    return user
+
+
+def _allowed_projects(user: dict) -> list[str] | None:
+    """Returns None for admin (= all projects), otherwise the list of allowed project_ids."""
+    if user.get("role") == "admin":
+        return None
+    return user.get("allowed_projects") or []
+
+
+def _enforce_project(user: dict, project: str | None) -> str | None:
+    """For non-admin users, ensure they can only query allowed projects.
+
+    Returns the (possibly defaulted) project to apply.
+    Raises 403 if the user asks for a project they cannot see.
+    """
+    allowed = _allowed_projects(user)
+    if allowed is None:
+        return project  # admin: pass-through
+    if not allowed:
+        # No projects assigned at all → no access
+        raise HTTPException(403, "no project access assigned")
+    if project:
+        if project not in allowed:
+            raise HTTPException(403, f"no access to project '{project}'")
+        return project
+    # No project specified → restrict using IN-clause via build_scope helper
+    return None
 
 
 # ─── Time / filter helpers ─────────────────────────────────────────────────────
@@ -146,14 +216,31 @@ def time_window(time_range: str | None, start: str | None, end: str | None):
 
 
 def build_scope(project, platform, service, time_range, start, end, time_col,
-                with_platform=True):
-    """Returns (where_sql, params_list, start, end). Uses wide_spans_detail-like cols."""
+                with_platform=True, user: dict | None = None):
+    """Returns (where_sql, params_list, start, end). Uses wide_spans_detail-like cols.
+
+    When `user` is provided and is not admin, project filter is restricted to the
+    user's allowed_projects. If `project` is given, it is validated against allowed.
+    """
     s, e = time_window(time_range, start, end)
     clauses = [f'"{time_col}" BETWEEN ? AND ?']
     params = [s, e]
+    allowed = _allowed_projects(user) if user else None
     if project:
+        if allowed is not None and project not in allowed:
+            raise HTTPException(403, f"no access to project '{project}'")
         clauses.append("project_id = ?")
         params.append(project)
+    elif allowed is not None:
+        if not allowed:
+            # User has no project assignments → return a clause that yields nothing
+            clauses.append("1 = 0")
+        elif len(allowed) == 1:
+            clauses.append("project_id = ?")
+            params.append(allowed[0])
+        else:
+            clauses.append(f"project_id IN ({','.join('?'*len(allowed))})")
+            params.extend(allowed)
     if with_platform and platform:
         plats = [p for p in platform.split(",") if p]
         if len(plats) == 1:
@@ -184,6 +271,23 @@ def bucket_fmt(time_range: str | None) -> str:
     return "%Y-%m-%d"                              # day
 
 
+def _proj_clause(user: dict | None, project: str | None) -> tuple[str | None, list]:
+    """Returns (sql_clause_or_None, params) enforcing project access for the user.
+    Used by endpoints that don't go through build_scope."""
+    allowed = _allowed_projects(user) if user else None
+    if project:
+        if allowed is not None and project not in allowed:
+            raise HTTPException(403, f"no access to project '{project}'")
+        return "project_id = ?", [project]
+    if allowed is None:
+        return None, []
+    if not allowed:
+        return "1 = 0", []
+    if len(allowed) == 1:
+        return "project_id = ?", [allowed[0]]
+    return f"project_id IN ({','.join('?'*len(allowed))})", list(allowed)
+
+
 # ─── App ───────────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -203,9 +307,16 @@ class Creds(BaseModel):
 
 @app.post("/api/login")
 def do_login(c: Creds):
-    if c.username != ADMIN_USER or c.password != ADMIN_PASS:
+    u = get_user(c.username)
+    if u is None or u.get("password") != c.password:
         raise HTTPException(401, "bad credentials")
-    return {"token": make_token(c.username), "user": c.username}
+    return {"token": make_token(u["username"], u["role"]), "user": u["username"],
+            "role": u["role"], "allowed_projects": u["allowed_projects"]}
+
+
+@app.get("/api/me")
+def get_me(user: dict = Depends(require_auth)):
+    return user
 
 
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
@@ -233,7 +344,17 @@ def do_login_google(c: GoogleCreds):
         raise HTTPException(403, f"only {ALLOWED_DOMAIN} accounts allowed")
     if not email:
         raise HTTPException(401, "no email in Google token")
-    return {"token": make_token(email), "user": email}
+    # auto-provision google users as 'user' role with no project access by default
+    u = get_user(email)
+    if u is None:
+        execute("INSERT INTO users (username, password, role, allowed_projects, created_at) VALUES (?,?,?,?,?)",
+                [email, "", "user", "[]", datetime.now(tz=timezone.utc).isoformat()])
+        role = "user"
+        allowed = []
+    else:
+        role = u["role"]
+        allowed = u["allowed_projects"]
+    return {"token": make_token(email, role), "user": email, "role": role, "allowed_projects": allowed}
 
 
 @app.get("/api/config")
@@ -255,7 +376,7 @@ def health():
 # ─── Pricing ───────────────────────────────────────────────────────────────────
 
 @app.get("/api/config/pricing")
-def list_pricing(_user=Depends(require_auth)):
+def list_pricing(user: dict = Depends(require_auth)):
     return run("""SELECT id, model_prefix,
                   input_cost_per_1m_tokens AS input_cost,
                   output_cost_per_1m_tokens AS output_cost,
@@ -272,7 +393,7 @@ class PriceIn(BaseModel):
 
 
 @app.post("/api/config/pricing")
-def add_pricing(p: PriceIn, _user=Depends(require_auth)):
+def add_pricing(p: PriceIn, user: dict = Depends(require_auth)):
     prefix = p.model_prefix.strip()
     if not prefix:
         raise HTTPException(400, "model name required")
@@ -296,7 +417,7 @@ class PricePatch(BaseModel):
 
 
 @app.patch("/api/config/pricing/{pid}")
-def patch_pricing(pid: str, p: PricePatch, _user=Depends(require_auth)):
+def patch_pricing(pid: str, p: PricePatch, user: dict = Depends(require_auth)):
     sets, params = [], []
     if p.active is not None:
         sets.append("active=?")
@@ -319,28 +440,37 @@ def patch_pricing(pid: str, p: PricePatch, _user=Depends(require_auth)):
 # ─── Filters ───────────────────────────────────────────────────────────────────
 
 @app.get("/api/filters/projects")
-def projects(_user=Depends(require_auth)):
-    return run("SELECT DISTINCT project_id FROM wide_spans_detail WHERE project_id IS NOT NULL ORDER BY project_id")
+def projects(user: dict = Depends(require_auth)):
+    allowed = _allowed_projects(user)
+    if allowed is None:
+        return run("SELECT DISTINCT project_id FROM wide_spans_detail WHERE project_id IS NOT NULL ORDER BY project_id")
+    if not allowed:
+        return []
+    ph = ",".join("?" * len(allowed))
+    return run(f"SELECT DISTINCT project_id FROM wide_spans_detail WHERE project_id IN ({ph}) ORDER BY project_id",
+               list(allowed))
 
 
 @app.get("/api/filters/platforms")
-def platforms(project: str | None = None, _user=Depends(require_auth)):
+def platforms(project: str | None = None, user: dict = Depends(require_auth)):
     sql = "SELECT DISTINCT environment AS source_platform FROM wide_spans_detail WHERE environment IS NOT NULL"
     params = []
-    if project:
-        sql += " AND project_id = ?"
-        params.append(project)
+    pc, pp = _proj_clause(user, project)
+    if pc:
+        sql += " AND " + pc
+        params.extend(pp)
     sql += " ORDER BY source_platform"
     return run(sql, params)
 
 
 @app.get("/api/filters/services")
-def services(project: str | None = None, platform: str | None = None, _user=Depends(require_auth)):
+def services(project: str | None = None, platform: str | None = None, user: dict = Depends(require_auth)):
     sql = "SELECT DISTINCT service_id AS service_name FROM wide_spans_detail WHERE service_id IS NOT NULL"
     params = []
-    if project:
-        sql += " AND project_id = ?"
-        params.append(project)
+    pc, pp = _proj_clause(user, project)
+    if pc:
+        sql += " AND " + pc
+        params.extend(pp)
     if platform:
         sql += " AND environment = ?"
         params.append(platform)
@@ -350,13 +480,25 @@ def services(project: str | None = None, platform: str | None = None, _user=Depe
 
 # ─── Overview ──────────────────────────────────────────────────────────────────
 
-def _llm_cost_subq(start, end, project, platform, service):
+def _llm_cost_subq(start, end, project, platform, service, user: dict | None = None):
     """LLM cost/tokens via wide_llm_interactions_detail."""
     cl = ['timestamp BETWEEN ? AND ?']
     pp = [start, end]
+    allowed = _allowed_projects(user) if user else None
     if project:
+        if allowed is not None and project not in allowed:
+            raise HTTPException(403, f"no access to project '{project}'")
         cl.append("project_id=?")
         pp.append(project)
+    elif allowed is not None:
+        if not allowed:
+            cl.append("1 = 0")
+        elif len(allowed) == 1:
+            cl.append("project_id=?")
+            pp.append(allowed[0])
+        else:
+            cl.append(f"project_id IN ({','.join('?'*len(allowed))})")
+            pp.extend(allowed)
     if platform:
         cl.append("environment=?")
         pp.append(platform)
@@ -369,8 +511,8 @@ def _llm_cost_subq(start, end, project, platform, service):
 @app.get("/api/overview")
 def overview(project: str | None = None, platform: str | None = None, service: str | None = None,
              time_range: str = "1h", start: str | None = None, end: str | None = None,
-             _user=Depends(require_auth)):
-    w, p, s, e = build_scope(project, platform, service, time_range, start, end, "start_time")
+             user: dict = Depends(require_auth)):
+    w, p, s, e = build_scope(project, platform, service, time_range, start, end, "start_time", user=user)
     span_kpi = run(f"""SELECT
         COUNT(DISTINCT trace_id) AS traces,
         COUNT(*) AS spans,
@@ -378,7 +520,7 @@ def overview(project: str | None = None, platform: str | None = None, service: s
         COUNT(DISTINCT project_id) AS projects,
         CAST(SUM(CASE WHEN status_code='ERROR' THEN 1 ELSE 0 END) AS REAL)/NULLIF(COUNT(*),0) AS error_rate
         FROM wide_spans_detail {w}""", p)
-    llm_w, llm_p = _llm_cost_subq(s, e, project, platform, service)
+    llm_w, llm_p = _llm_cost_subq(s, e, project, platform, service, user=user)
     llm_kpi = run(f"""SELECT
         ROUND(COALESCE(SUM(cost),0), 6) AS cost_usd,
         COALESCE(SUM(tokens_input), 0) AS input_tokens,
@@ -398,15 +540,15 @@ def overview(project: str | None = None, platform: str | None = None, service: s
 @app.get("/api/overview/timeseries")
 def overview_ts(project: str | None = None, platform: str | None = None, service: str | None = None,
                 time_range: str = "1h", start: str | None = None, end: str | None = None,
-                _user=Depends(require_auth)):
-    w, p, s, e = build_scope(project, platform, service, time_range, start, end, "start_time")
+                user: dict = Depends(require_auth)):
+    w, p, s, e = build_scope(project, platform, service, time_range, start, end, "start_time", user=user)
     fmt = bucket_fmt(time_range)
     spans = run(f"""SELECT strftime('{fmt}', start_time) AS bucket,
         COUNT(DISTINCT trace_id) AS traces,
         SUM(CASE WHEN status_code='ERROR' THEN 1 ELSE 0 END) AS errors
         FROM wide_spans_detail {w}
         GROUP BY bucket ORDER BY bucket""", p)
-    llm_w, llm_p = _llm_cost_subq(s, e, project, platform, service)
+    llm_w, llm_p = _llm_cost_subq(s, e, project, platform, service, user=user)
     llm = run(f"""SELECT strftime('{fmt}', timestamp) AS bucket,
         ROUND(COALESCE(SUM(cost),0), 6) AS cost_usd,
         COALESCE(SUM(tokens_input), 0) AS input_tokens,
@@ -427,8 +569,8 @@ def overview_ts(project: str | None = None, platform: str | None = None, service
 @app.get("/api/latency/timeseries")
 def latency_ts(project: str | None = None, platform: str | None = None, service: str | None = None,
                time_range: str = "1h", start: str | None = None, end: str | None = None,
-               _user=Depends(require_auth)):
-    w, p, _, _ = build_scope(project, platform, service, time_range, start, end, "start_time")
+               user: dict = Depends(require_auth)):
+    w, p, _, _ = build_scope(project, platform, service, time_range, start, end, "start_time", user=user)
     fmt = bucket_fmt(time_range)
     rows = run(f"""SELECT strftime('{fmt}', start_time) AS bucket, duration_ms
         FROM wide_spans_detail {w} AND parent_span_id IS NULL
@@ -452,8 +594,8 @@ def latency_ts(project: str | None = None, platform: str | None = None, service:
 @app.get("/api/traces")
 def traces(project: str | None = None, platform: str | None = None, service: str | None = None,
            time_range: str = "1h", start: str | None = None, end: str | None = None,
-           page: int = 1, page_size: int = 50, _user=Depends(require_auth)):
-    w, p, _, _ = build_scope(project, platform, service, time_range, start, end, "start_time")
+           page: int = 1, page_size: int = 50, user: dict = Depends(require_auth)):
+    w, p, _, _ = build_scope(project, platform, service, time_range, start, end, "start_time", user=user)
     total = run(f"SELECT COUNT(*) AS n FROM (SELECT trace_id FROM wide_spans_detail {w} GROUP BY trace_id)", p)
     off = max(0, (page - 1) * page_size)
     rows = run(f"""SELECT trace_id,
@@ -488,17 +630,34 @@ def traces(project: str | None = None, platform: str | None = None, service: str
 
 
 @app.get("/api/traces/{trace_id}")
-def trace_detail(trace_id: str, _user=Depends(require_auth)):
-    return run("""
+def trace_detail(trace_id: str, user: dict = Depends(require_auth)):
+    allowed = _allowed_projects(user)
+    if allowed is not None:
+        if not allowed:
+            raise HTTPException(403, "no project access")
+        # Check that this trace belongs to a project the user can see
+        ph = ",".join("?" * len(allowed))
+        chk = run(f"SELECT COUNT(*) AS n FROM wide_spans_detail WHERE trace_id = ? AND project_id IN ({ph})",
+                  [trace_id] + list(allowed))
+        if not chk or chk[0]["n"] == 0:
+            raise HTTPException(403, "no access to this trace")
+    # Defense-in-depth: filter returned spans by allowed projects for non-admins
+    extra = ""
+    extra_params: list = []
+    if allowed is not None:
+        ph = ",".join("?" * len(allowed))
+        extra = f" AND project_id IN ({ph})"
+        extra_params = list(allowed)
+    return run(f"""
         SELECT trace_id, span_id, parent_span_id, span_name, span_kind,
                start_time, end_time, duration_ms, status_code, status_message,
                service_id AS service_name, agent_name,
                session_id AS conversation_id, model_id AS model,
                attributes_json
         FROM wide_spans_detail
-        WHERE trace_id = ?
+        WHERE trace_id = ?{extra}
         ORDER BY start_time
-    """, [trace_id])
+    """, [trace_id] + extra_params)
 
 
 # ─── Logs ──────────────────────────────────────────────────────────────────────
@@ -506,8 +665,8 @@ def trace_detail(trace_id: str, _user=Depends(require_auth)):
 @app.get("/api/logs")
 def logs(project: str | None = None, service: str | None = None, severity: str | None = None,
          time_range: str = "1h", start: str | None = None, end: str | None = None,
-         page: int = 1, page_size: int = 50, _user=Depends(require_auth)):
-    w, p, _, _ = build_scope(project, None, service, time_range, start, end, "timestamp", with_platform=False)
+         page: int = 1, page_size: int = 50, user: dict = Depends(require_auth)):
+    w, p, _, _ = build_scope(project, None, service, time_range, start, end, "timestamp", with_platform=False, user=user)
     if severity:
         w += " AND severity = ?"
         p.append(severity)
@@ -524,13 +683,14 @@ def logs(project: str | None = None, service: str | None = None, severity: str |
 @app.get("/api/metrics/catalog")
 def metrics_catalog(project: str | None = None, service: str | None = None,
                     time_range: str = "1h", start: str | None = None, end: str | None = None,
-                    _user=Depends(require_auth)):
+                    user: dict = Depends(require_auth)):
     s, e = time_window(time_range, start, end)
     base = "FROM wide_metrics_detail WHERE timestamp BETWEEN ? AND ?"
     pa = [s, e]
-    if project:
-        base += " AND project_id = ?"
-        pa.append(project)
+    pc_, pp_ = _proj_clause(user, project)
+    if pc_:
+        base += " AND " + pc_
+        pa.extend(pp_)
     if service:
         base += " AND service_id = ?"
         pa.append(service)
@@ -545,13 +705,14 @@ def metrics_catalog(project: str | None = None, service: str | None = None,
 def metrics_summary(project: str | None = None, service: str | None = None,
                     time_range: str = "1h", start: str | None = None, end: str | None = None,
                     state: str | None = None, readiness: str | None = None, rclass: str | None = None,
-                    _user=Depends(require_auth)):
+                    user: dict = Depends(require_auth)):
     s, e = time_window(time_range, start, end)
     cl = ["timestamp BETWEEN ? AND ?"]
     pa = [s, e]
-    if project:
-        cl.append("project_id=?")
-        pa.append(project)
+    pc_, pp_ = _proj_clause(user, project)
+    if pc_:
+        cl.append(pc_)
+        pa.extend(pp_)
     if service:
         cl.append("service_id=?")
         pa.append(service)
@@ -571,14 +732,15 @@ def metrics_ts(category: str | None = None, group: str | None = None, agg: str |
                metric_type: str | None = None,
                project: str | None = None, service: str | None = None,
                time_range: str = "1h", start: str | None = None, end: str | None = None,
-               _user=Depends(require_auth)):
+               user: dict = Depends(require_auth)):
     s, e = time_window(time_range, start, end)
     fmt = bucket_fmt(time_range)
     cl = ["timestamp BETWEEN ? AND ?"]
     pa = [s, e]
-    if project:
-        cl.append("project_id=?")
-        pa.append(project)
+    pc_, pp_ = _proj_clause(user, project)
+    if pc_:
+        cl.append(pc_)
+        pa.extend(pp_)
     if service:
         cl.append("service_id=?")
         pa.append(service)
@@ -602,13 +764,14 @@ def metrics_ts(category: str | None = None, group: str | None = None, agg: str |
 def metrics_table(project: str | None = None, service: str | None = None,
                   time_range: str = "1h", start: str | None = None, end: str | None = None,
                   category: str | None = None, metric_type: str | None = None,
-                  limit: int = 500, _user=Depends(require_auth)):
+                  limit: int = 500, user: dict = Depends(require_auth)):
     s, e = time_window(time_range, start, end)
     cl = ["timestamp BETWEEN ? AND ?"]
     pa = [s, e]
-    if project:
-        cl.append("project_id=?")
-        pa.append(project)
+    pc_, pp_ = _proj_clause(user, project)
+    if pc_:
+        cl.append(pc_)
+        pa.extend(pp_)
     if service:
         cl.append("service_id=?")
         pa.append(service)
@@ -634,7 +797,7 @@ def metrics_table(project: str | None = None, service: str | None = None,
 def cost(group_by: str = "service_name",
          project: str | None = None, platform: str | None = None, service: str | None = None,
          time_range: str = "1h", start: str | None = None, end: str | None = None,
-         _user=Depends(require_auth)):
+         user: dict = Depends(require_auth)):
     allowed = {"service_name": "service_id", "model": "model_name", "project_id": "project_id",
                "source_platform": "environment"}
     if group_by not in allowed:
@@ -643,9 +806,10 @@ def cost(group_by: str = "service_name",
     s, e = time_window(time_range, start, end)
     cl = ["timestamp BETWEEN ? AND ?"]
     pa = [s, e]
-    if project:
-        cl.append("project_id=?")
-        pa.append(project)
+    pc_, pp_ = _proj_clause(user, project)
+    if pc_:
+        cl.append(pc_)
+        pa.extend(pp_)
     if platform:
         cl.append("environment=?")
         pa.append(platform)
@@ -667,8 +831,8 @@ def cost(group_by: str = "service_name",
 @app.get("/api/sessions")
 def sessions(project: str | None = None, platform: str | None = None, service: str | None = None,
              time_range: str = "1h", start: str | None = None, end: str | None = None,
-             limit: int = 200, _user=Depends(require_auth)):
-    w, p, _, _ = build_scope(project, platform, service, time_range, start, end, "start_time")
+             limit: int = 200, user: dict = Depends(require_auth)):
+    w, p, _, _ = build_scope(project, platform, service, time_range, start, end, "start_time", user=user)
     rows = run(f"""SELECT session_id AS conversation_id,
         MAX(service_id) AS service_name,
         COUNT(DISTINCT trace_id) AS turns,
@@ -691,12 +855,27 @@ def sessions(project: str | None = None, platform: str | None = None, service: s
 
 
 @app.get("/api/sessions/{conversation_id}")
-def session_detail(conversation_id: str, _user=Depends(require_auth)):
-    rows = run("""SELECT trace_id, MAX(service_id) AS service_name, MIN(start_time) AS start_time,
+def session_detail(conversation_id: str, user: dict = Depends(require_auth)):
+    allowed = _allowed_projects(user)
+    if allowed is not None:
+        if not allowed:
+            raise HTTPException(403, "no project access")
+        ph = ",".join("?" * len(allowed))
+        chk = run(f"SELECT COUNT(*) AS n FROM wide_spans_detail WHERE session_id = ? AND project_id IN ({ph})",
+                  [conversation_id] + list(allowed))
+        if not chk or chk[0]["n"] == 0:
+            raise HTTPException(403, "no access to this session")
+    # Defense-in-depth: filter rows by allowed projects for non-admins
+    extra_w, extra_p = "", []
+    if allowed is not None:
+        ph = ",".join("?" * len(allowed))
+        extra_w = f" AND project_id IN ({ph})"
+        extra_p = list(allowed)
+    rows = run(f"""SELECT trace_id, MAX(service_id) AS service_name, MIN(start_time) AS start_time,
         MAX(CASE WHEN parent_span_id IS NULL THEN span_name END) AS root_span,
         MAX(CASE WHEN parent_span_id IS NULL THEN duration_ms END) AS duration_ms
-        FROM wide_spans_detail WHERE session_id = ?
-        GROUP BY trace_id ORDER BY start_time""", [conversation_id])
+        FROM wide_spans_detail WHERE session_id = ?{extra_w}
+        GROUP BY trace_id ORDER BY start_time""", [conversation_id] + extra_p)
     trace_ids = [r["trace_id"] for r in rows]
     if trace_ids:
         ph = ",".join("?"*len(trace_ids))
@@ -716,7 +895,7 @@ def session_detail(conversation_id: str, _user=Depends(require_auth)):
 @app.get("/api/tools")
 def tools(project: str | None = None, platform: str | None = None, service: str | None = None,
           time_range: str = "1h", start: str | None = None, end: str | None = None,
-          _user=Depends(require_auth)):
+          user: dict = Depends(require_auth)):
     s, e = time_window(time_range, start, end)
     cl = ["timestamp BETWEEN ? AND ?"]
     pa = [s, e]
@@ -738,19 +917,21 @@ def tools(project: str | None = None, platform: str | None = None, service: str 
 # ─── Search ────────────────────────────────────────────────────────────────────
 
 @app.get("/api/search")
-def search(q: str, _user=Depends(require_auth)):
+def search(q: str, user: dict = Depends(require_auth)):
     if len(q) < 2:
         return {}
     like = f"%{q}%"
     pre = f"{q}%"
+    pc_, pp_ = _proj_clause(user, None)
+    extra = (" AND " + pc_) if pc_ else ""
     def one(sql, prm):
         return [r["v"] for r in run(sql, prm) if r["v"]]
     return {
-        "projects": one("SELECT DISTINCT project_id AS v FROM wide_spans_detail WHERE project_id LIKE ? LIMIT 6", [like]),
-        "services": one("SELECT DISTINCT service_id AS v FROM wide_spans_detail WHERE service_id LIKE ? LIMIT 6", [like]),
-        "models": one("SELECT DISTINCT model_id AS v FROM wide_spans_detail WHERE model_id LIKE ? LIMIT 6", [like]),
-        "traces": one("SELECT DISTINCT trace_id AS v FROM wide_spans_detail WHERE trace_id LIKE ? LIMIT 6", [pre]),
-        "conversations": one("SELECT DISTINCT session_id AS v FROM wide_spans_detail WHERE session_id LIKE ? LIMIT 6", [like]),
+        "projects": one(f"SELECT DISTINCT project_id AS v FROM wide_spans_detail WHERE project_id LIKE ?{extra} LIMIT 6", [like] + pp_),
+        "services": one(f"SELECT DISTINCT service_id AS v FROM wide_spans_detail WHERE service_id LIKE ?{extra} LIMIT 6", [like] + pp_),
+        "models": one(f"SELECT DISTINCT model_id AS v FROM wide_spans_detail WHERE model_id LIKE ?{extra} LIMIT 6", [like] + pp_),
+        "traces": one(f"SELECT DISTINCT trace_id AS v FROM wide_spans_detail WHERE trace_id LIKE ?{extra} LIMIT 6", [pre] + pp_),
+        "conversations": one(f"SELECT DISTINCT session_id AS v FROM wide_spans_detail WHERE session_id LIKE ?{extra} LIMIT 6", [like] + pp_),
     }
 
 
@@ -760,8 +941,8 @@ def search(q: str, _user=Depends(require_auth)):
 def top_traces(by: str = "cost",
                project: str | None = None, platform: str | None = None, service: str | None = None,
                time_range: str = "1h", start: str | None = None, end: str | None = None,
-               limit: int = 20, _user=Depends(require_auth)):
-    w, p, _, _ = build_scope(project, platform, service, time_range, start, end, "start_time")
+               limit: int = 20, user: dict = Depends(require_auth)):
+    w, p, _, _ = build_scope(project, platform, service, time_range, start, end, "start_time", user=user)
     spans = run(f"""SELECT trace_id, MAX(service_id) AS service_name, MAX(agent_name) AS agent_name,
         MIN(start_time) AS start_time,
         MAX(CASE WHEN parent_span_id IS NULL THEN duration_ms END) AS duration_ms
@@ -786,13 +967,14 @@ def top_traces(by: str = "cost",
 @app.get("/api/models")
 def models(project: str | None = None, platform: str | None = None, service: str | None = None,
            time_range: str = "1h", start: str | None = None, end: str | None = None,
-           _user=Depends(require_auth)):
+           user: dict = Depends(require_auth)):
     s, e = time_window(time_range, start, end)
     cl = ["timestamp BETWEEN ? AND ?"]
     pa = [s, e]
-    if project:
-        cl.append("project_id=?")
-        pa.append(project)
+    pc_, pp_ = _proj_clause(user, project)
+    if pc_:
+        cl.append(pc_)
+        pa.extend(pp_)
     if platform:
         cl.append("environment=?")
         pa.append(platform)
@@ -812,8 +994,8 @@ def models(project: str | None = None, platform: str | None = None, service: str
 @app.get("/api/errors/by-service")
 def errors_by_service(project: str | None = None, platform: str | None = None, service: str | None = None,
                       time_range: str = "1h", start: str | None = None, end: str | None = None,
-                      _user=Depends(require_auth)):
-    w, p, _, _ = build_scope(project, platform, service, time_range, start, end, "start_time")
+                      user: dict = Depends(require_auth)):
+    w, p, _, _ = build_scope(project, platform, service, time_range, start, end, "start_time", user=user)
     return run(f"""SELECT service_id AS service_name, COUNT(*) AS spans,
         SUM(CASE WHEN status_code='ERROR' THEN 1 ELSE 0 END) AS errors,
         ROUND(CAST(SUM(CASE WHEN status_code='ERROR' THEN 1 ELSE 0 END) AS REAL)/NULLIF(COUNT(*),0), 4) AS error_rate
@@ -824,8 +1006,8 @@ def errors_by_service(project: str | None = None, platform: str | None = None, s
 @app.get("/api/errors/top")
 def errors_top(project: str | None = None, service: str | None = None,
                time_range: str = "1h", start: str | None = None, end: str | None = None,
-               _user=Depends(require_auth)):
-    w, p, _, _ = build_scope(project, None, service, time_range, start, end, "timestamp", with_platform=False)
+               user: dict = Depends(require_auth)):
+    w, p, _, _ = build_scope(project, None, service, time_range, start, end, "timestamp", with_platform=False, user=user)
     return run(f"""SELECT message, MAX(service_id) AS service_name, COUNT(*) AS occurrences,
         MAX(timestamp) AS last_seen
         FROM wide_logs_detail {w} AND severity IN ('ERROR','FATAL') AND message IS NOT NULL
@@ -833,15 +1015,17 @@ def errors_top(project: str | None = None, service: str | None = None,
 
 
 @app.get("/api/health/services")
-def health_services(_user=Depends(require_auth)):
+def health_services(user: dict = Depends(require_auth)):
     now = datetime.now(tz=timezone.utc)
     lookback = (now - timedelta(hours=48)).isoformat()
-    rows = run("""SELECT service_id AS service_name, MAX(environment) AS platform,
+    pc_, pp_ = _proj_clause(user, None)
+    extra = (" AND " + pc_) if pc_ else ""
+    rows = run(f"""SELECT service_id AS service_name, MAX(environment) AS platform,
         MAX(project_id) AS project_id, MAX(start_time) AS last_seen,
         COUNT(DISTINCT trace_id) AS traces_48h,
         ROUND(CAST(SUM(CASE WHEN status_code='ERROR' THEN 1 ELSE 0 END) AS REAL)/NULLIF(COUNT(*),0), 4) AS error_rate
-        FROM wide_spans_detail WHERE start_time >= ?
-        GROUP BY service_id ORDER BY last_seen DESC""", [lookback])
+        FROM wide_spans_detail WHERE start_time >= ?{extra}
+        GROUP BY service_id ORDER BY last_seen DESC""", [lookback] + pp_)
     # add minutes_since and cost_48h
     sids = [r["service_name"] for r in rows]
     cost_map = {}
@@ -869,7 +1053,7 @@ def health_services(_user=Depends(require_auth)):
 # ─── Meta / refresh ────────────────────────────────────────────────────────────
 
 @app.get("/api/meta/last-refresh")
-def last_refresh(_user=Depends(require_auth)):
+def last_refresh(user: dict = Depends(require_auth)):
     out = {}
     for name, tbl, col in (("spans", "wide_spans_detail", "start_time"),
                            ("logs", "wide_logs_detail", "timestamp"),
@@ -883,13 +1067,96 @@ def last_refresh(_user=Depends(require_auth)):
 
 
 @app.post("/api/refresh/pipeline")
-def refresh_pipeline(_user=Depends(require_auth)):
+def refresh_pipeline(user: dict = Depends(require_auth)):
     return {"started": True, "execution": "local-mock-execution"}
 
 
 @app.get("/api/refresh/status")
-def refresh_status(execution: str, _user=Depends(require_auth)):
+def refresh_status(execution: str, user: dict = Depends(require_auth)):
     return {"state": "SUCCEEDED"}
+
+
+# ─── Admin: RBAC user management ───────────────────────────────────────────────
+
+class UserIn(BaseModel):
+    username: str
+    password: str
+    role: str = "user"  # 'user' or 'admin'
+    allowed_projects: list[str] = []
+
+
+class UserPatch(BaseModel):
+    password: str | None = None
+    role: str | None = None
+    allowed_projects: list[str] | None = None
+
+
+@app.get("/api/admin/users")
+def list_users(_admin: dict = Depends(require_admin)):
+    rows = run("SELECT username, role, allowed_projects, created_at FROM users ORDER BY username")
+    for r in rows:
+        try:
+            r["allowed_projects"] = json.loads(r.get("allowed_projects") or "[]")
+        except Exception:
+            r["allowed_projects"] = []
+    return rows
+
+
+@app.post("/api/admin/users")
+def create_user(u: UserIn, _admin: dict = Depends(require_admin)):
+    if not u.username.strip() or not u.password:
+        raise HTTPException(400, "username and password are required")
+    if u.role not in ("admin", "user"):
+        raise HTTPException(400, "role must be 'admin' or 'user'")
+    if get_user(u.username):
+        raise HTTPException(409, "user already exists")
+    execute("INSERT INTO users (username, password, role, allowed_projects, created_at) VALUES (?,?,?,?,?)",
+            [u.username.strip(), u.password, u.role, json.dumps(u.allowed_projects or []),
+             datetime.now(tz=timezone.utc).isoformat()])
+    return {"ok": True}
+
+
+@app.patch("/api/admin/users/{username}")
+def update_user(username: str, u: UserPatch, admin: dict = Depends(require_admin)):
+    existing = get_user(username)
+    if not existing:
+        raise HTTPException(404, "user not found")
+    sets, params = [], []
+    if u.password is not None:
+        sets.append("password=?")
+        params.append(u.password)
+    if u.role is not None:
+        if u.role not in ("admin", "user"):
+            raise HTTPException(400, "role must be 'admin' or 'user'")
+        # Prevent admin from demoting themselves (avoid lockout)
+        if username == admin["username"] and u.role != "admin":
+            raise HTTPException(400, "cannot demote your own admin role")
+        sets.append("role=?")
+        params.append(u.role)
+    if u.allowed_projects is not None:
+        sets.append("allowed_projects=?")
+        params.append(json.dumps(u.allowed_projects))
+    if not sets:
+        raise HTTPException(400, "nothing to update")
+    params.append(username)
+    execute(f"UPDATE users SET {', '.join(sets)} WHERE username=?", params)
+    return {"ok": True}
+
+
+@app.delete("/api/admin/users/{username}")
+def delete_user(username: str, admin: dict = Depends(require_admin)):
+    if username == admin["username"]:
+        raise HTTPException(400, "cannot delete yourself")
+    if not get_user(username):
+        raise HTTPException(404, "user not found")
+    execute("DELETE FROM users WHERE username=?", [username])
+    return {"ok": True}
+
+
+@app.get("/api/admin/projects")
+def admin_all_projects(_admin: dict = Depends(require_admin)):
+    """Return every project_id present in spans (unfiltered) for assignment UI."""
+    return run("SELECT DISTINCT project_id FROM wide_spans_detail WHERE project_id IS NOT NULL ORDER BY project_id")
 
 
 # ─── Static SPA (production: served from /app/backend/static) ─────────────────

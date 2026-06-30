@@ -417,6 +417,7 @@ def gen_spans(now: datetime | None = None, n_traces: int = 25) -> list[dict]:
         service    = random.choice(SERVICES)
         agent      = random.choice(AGENTS)
         env        = random.choice(ENVIRONMENTS)
+        project_id = random.choice(PROJECT_IDS)
         session_id = str(uuid.uuid4())
         n_spans    = random.randint(2, 6)
         t0         = now - timedelta(seconds=random.randint(60, 7 * 24 * 3600))
@@ -438,7 +439,7 @@ def gen_spans(now: datetime | None = None, n_traces: int = 25) -> list[dict]:
             "span_name":      "handle_request",
             "span_kind":      "SERVER",
             "environment":    env,
-            "project_id":     PROJECT_ID,
+            "project_id":     project_id,
             "start_time":     _iso(t0),
             "end_time":       _iso(t0 + timedelta(milliseconds=root_dur)),
             "duration_ms":    round(root_dur, 3),
@@ -500,7 +501,7 @@ def gen_spans(now: datetime | None = None, n_traces: int = 25) -> list[dict]:
                 "span_name":      f"{op}_span_{i+1}",
                 "span_kind":      random.choice(SPAN_KINDS),
                 "environment":    env,
-                "project_id":     PROJECT_ID,
+                "project_id":     project_id,
                 "start_time":     _iso(cursor),
                 "end_time":       _iso(cursor + timedelta(milliseconds=dur)),
                 "duration_ms":    round(dur, 3),
@@ -564,7 +565,7 @@ def gen_llm_usage_daily(now: datetime | None = None) -> list[dict]:
                 "model_name":          model,
                 "provider":            provider,
                 "service_id":          service,
-                "project_id":          PROJECT_ID,
+                "project_id":          random.choice(PROJECT_IDS),
                 "environment":         random.choice(ENVIRONMENTS),
                 "total_llm_calls":     n_calls,
                 "total_tokens_input":  inp,
@@ -588,7 +589,7 @@ def gen_logs_detail(now: datetime | None = None, n: int = 150) -> list[dict]:
             "span_id":     uuid.uuid4().hex[:16] if random.random() > 0.3 else None,
             "service_id":  random.choice(SERVICES),
             "environment": random.choice(ENVIRONMENTS),
-            "project_id":  PROJECT_ID,
+            "project_id":  random.choice(PROJECT_IDS),
             "severity":    random.choice(SEVERITIES),
             "message":     random.choice(LOG_MESSAGES),
             "timestamp":   _iso(ts),
@@ -633,7 +634,7 @@ def gen_metrics_detail(now: datetime | None = None, n: int = 80) -> list[dict]:
             "metric_type":     mtype,
             "service_id":      random.choice(SERVICES),
             "environment":     random.choice(ENVIRONMENTS),
-            "project_id":      PROJECT_ID,
+            "project_id":      random.choice(PROJECT_IDS),
             "agent_name":      random.choice(AGENTS),
             "value_int":       None if is_hist else random.randint(100, 5000),
             "value_double":    None,
